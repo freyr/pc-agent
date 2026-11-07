@@ -70,13 +70,14 @@ pub struct Snapshot {
 }
 
 /// The sleep and wake events that a source sends to the core.
-// The sources of later tasks send the events.
+// Linux sends no events yet (task 9).
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum SystemEvent {
-    /// The system goes to sleep. The core completes `queued` after it has
-    /// queued the `Suspend` state and `offline`.
-    Suspend { queued: oneshot::Sender<()> },
+    /// The system goes to sleep. The core publishes the `Suspend` state and
+    /// `offline`, then completes `done` when the broker has acknowledged
+    /// `offline`, after 2 s without the ack, or at once when not connected.
+    Suspend { done: oneshot::Sender<()> },
     /// The system woke up.
     Resume,
 }

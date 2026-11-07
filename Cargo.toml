@@ -15,6 +15,9 @@ toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
 nvml-wrapper = "0.13.0"

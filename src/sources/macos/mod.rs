@@ -1,6 +1,7 @@
 //! The macOS sources.
 
 mod iokit;
+mod power;
 mod rules;
 
 use std::sync::Mutex;
@@ -101,9 +102,12 @@ pub fn poll() -> Snapshot {
     }
 }
 
-/// The receiver of the sleep and wake events. No source sends them yet.
+/// The receiver of the sleep and wake events. Starts the power thread, so
+/// call it once.
 pub fn events() -> mpsc::Receiver<SystemEvent> {
-    mpsc::channel(1).1
+    let (tx, rx) = mpsc::channel(4);
+    power::start(tx);
+    rx
 }
 
 #[cfg(test)]

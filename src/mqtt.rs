@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rumqttc::{AsyncClient, Event, EventLoop, Incoming, LastWill, MqttOptions, Outgoing, QoS};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use tracing::{debug, info, warn};
 
@@ -89,26 +89,131 @@ fn availability_message(cfg: &Config, payload: &str) -> Message {
 }
 
 /// Handles one event of the source: its `lastsystemstatechange` state, then
-/// the availability. A `Suspend` reply is completed after both are queued.
+/// the availability. For `Suspend`, `offline` is the last publish, and the
+/// reply comes back to the caller, which completes it after the ack wait.
 fn handle_event(
     cfg: &Config,
     core: &mut Core,
     event: SystemEvent,
     mut publish: impl FnMut(Message),
-) {
+) -> Option<oneshot::Sender<()>> {
     match event {
-        SystemEvent::Suspend { queued } => {
+        SystemEvent::Suspend { done } => {
             for (entity, value) in core.event("Suspend") {
                 publish(state_message(cfg, entity, value));
             }
             publish(availability_message(cfg, OFFLINE));
-            let _ = queued.send(());
+            Some(done)
         }
         SystemEvent::Resume => {
             for (entity, value) in core.event("Resume") {
                 publish(state_message(cfg, entity, value));
             }
             publish(availability_message(cfg, ONLINE));
+            None
+        }
+    }
+}
+
+/// Finds the broker's ack of one `offline` publish in the events of the
+/// event loop.
+struct AckWait {
+    /// The publishes still to be written before `offline`.
+    to_skip: usize,
+    /// The packet id of `offline`, when it was written.
+    pkid: Option<u16>,
+}
+
+impl AckWait {
+    /// `backlog`: the publishes queued before `offline` and not yet written.
+    fn new(backlog: usize) -> Self {
+        AckWait {
+            to_skip: backlog,
+            pkid: None,
+        }
+    }
+
+    /// Takes one event; `true` when it is the ack of `offline`.
+    fn on_event(&mut self, event: &Event) -> bool {
+        match event {
+            Event::Outgoing(Outgoing::Publish(pkid)) if self.pkid.is_none() => {
+                if self.to_skip == 0 {
+                    self.pkid = Some(*pkid);
+                } else {
+                    self.to_skip -= 1;
+                }
+                false
+            }
+            Event::Incoming(Incoming::PubAck(ack)) => Some(ack.pkid) == self.pkid,
+            _ => false,
+        }
+    }
+}
+
+/// The reply of a `Suspend` that waits for the ack of its `offline`.
+/// The run loop keeps polling the event loop during the wait.
+#[derive(Default)]
+struct SuspendWait(Option<PendingSuspend>);
+
+struct PendingSuspend {
+    ack: AckWait,
+    deadline: tokio::time::Instant,
+    done: oneshot::Sender<()>,
+}
+
+impl SuspendWait {
+    /// Starts the wait of `done`. `backlog` is `None` when `offline` was not
+    /// queued (not connected): `done` completes at once.
+    fn start(
+        &mut self,
+        done: oneshot::Sender<()>,
+        backlog: Option<usize>,
+        now: tokio::time::Instant,
+    ) {
+        // A second Suspend ends the wait of the first.
+        self.finish();
+        match backlog {
+            None => {
+                let _ = done.send(());
+            }
+            Some(backlog) => {
+                self.0 = Some(PendingSuspend {
+                    ack: AckWait::new(backlog),
+                    deadline: now + OFFLINE_ACK_TIMEOUT,
+                    done,
+                })
+            }
+        }
+    }
+
+    fn on_event(&mut self, event: &Event) {
+        if let Some(pending) = &mut self.0
+            && pending.ack.on_event(event)
+        {
+            info!("offline acknowledged before sleep");
+            self.finish();
+        }
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.0.as_ref().map(|p| p.deadline)
+    }
+
+    /// Completes the reply when the deadline has passed.
+    fn expire(&mut self, now: tokio::time::Instant) {
+        if self.deadline().is_some_and(|d| now >= d) {
+            warn!(
+                "no ack for offline before sleep within {} s",
+                OFFLINE_ACK_TIMEOUT.as_secs()
+            );
+            self.finish();
+        }
+    }
+
+    /// Completes the reply at once, if a wait is in progress.
+    fn finish(&mut self) {
+        if let Some(pending) = self.0.take() {
+            let _ = pending.done.send(());
         }
     }
 }
@@ -125,14 +230,27 @@ struct Session {
 }
 
 impl Session {
-    fn publish(&mut self, msg: Message) {
+    /// Queues one publish; `true` when it is queued.
+    fn publish(&mut self, msg: Message) -> bool {
         match self
             .client
             .try_publish(&msg.topic, QoS::AtLeastOnce, true, msg.payload)
         {
-            Ok(()) => self.queued += 1,
-            Err(e) => warn!(topic = %msg.topic, error = %e, "cannot queue publish"),
+            Ok(()) => {
+                self.queued += 1;
+                true
+            }
+            Err(e) => {
+                warn!(topic = %msg.topic, error = %e, "cannot queue publish");
+                false
+            }
         }
+    }
+
+    /// The queued publishes that are not written yet. Saturating: a resend
+    /// after a reconnect also counts as written.
+    fn backlog(&self) -> usize {
+        self.queued.saturating_sub(self.sent)
     }
 
     fn publish_states(&mut self, cfg: &Config, states: Vec<State>) {
@@ -181,6 +299,7 @@ where
     let mut connected = false;
     // After a connection error: the time of the next connect attempt.
     let mut retry_at: Option<tokio::time::Instant> = None;
+    let mut suspend = SuspendWait::default();
 
     loop {
         tokio::select! {
@@ -194,12 +313,19 @@ where
                 }
             }
             Some(event) = events.recv() => {
-                handle_event(cfg, &mut core, event, |msg| {
-                    if connected {
-                        session.publish(msg);
-                    }
+                // `true` when the last publish (`offline` of a Suspend) is queued.
+                let mut last_queued = false;
+                let done = handle_event(cfg, &mut core, event, |msg| {
+                    last_queued = connected && session.publish(msg);
                 });
+                if let Some(done) = done {
+                    // `offline` is the last queued publish: the others before it.
+                    let backlog = last_queued.then(|| session.backlog().saturating_sub(1));
+                    suspend.start(done, backlog, tokio::time::Instant::now());
+                }
             }
+            _ = tokio::time::sleep_until(suspend.deadline().unwrap_or_else(tokio::time::Instant::now)),
+                if suspend.deadline().is_some() => suspend.expire(tokio::time::Instant::now()),
             event = session.eventloop.poll(), if retry_at.is_none() => match event {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!(host = %cfg.mqtt.host, port = cfg.mqtt.port, "connected to broker");
@@ -213,10 +339,13 @@ where
                 }
                 Ok(event) => {
                     session.record(&event);
+                    suspend.on_event(&event);
                     debug!(?event, "mqtt event");
                 }
                 Err(e) => {
                     connected = false;
+                    // The ack cannot come now: the Suspend does not wait.
+                    suspend.finish();
                     warn!(error = %e, "mqtt connection error, retry in {} s", RETRY_DELAY.as_secs());
                     retry_at = Some(tokio::time::Instant::now() + RETRY_DELAY);
                 }
@@ -224,31 +353,20 @@ where
         }
     }
 
+    suspend.finish();
     shutdown(&mut session, cfg).await;
     Ok(())
 }
 
 async fn shutdown(session: &mut Session, cfg: &Config) {
     info!("stopping: publish offline and disconnect");
-    let before = session.queued - session.sent;
+    let mut ack = AckWait::new(session.backlog());
     session.publish(availability_message(cfg, OFFLINE));
 
     let acked = timeout(OFFLINE_ACK_TIMEOUT, async {
-        // The offline publish is the (before + 1)th publish still to be written.
-        let mut to_skip = before;
-        let mut offline_pkid = None;
         loop {
             match session.eventloop.poll().await {
-                Ok(Event::Outgoing(Outgoing::Publish(pkid))) if offline_pkid.is_none() => {
-                    if to_skip == 0 {
-                        offline_pkid = Some(pkid);
-                    } else {
-                        to_skip -= 1;
-                    }
-                }
-                Ok(Event::Incoming(Incoming::PubAck(ack))) if Some(ack.pkid) == offline_pkid => {
-                    return;
-                }
+                Ok(event) if ack.on_event(&event) => return,
                 Ok(_) => {}
                 Err(e) => {
                     warn!(error = %e, "mqtt connection error while stopping");
@@ -350,15 +468,18 @@ enabled = false
 
     /// Sends `event` through a fake channel and gives the messages that the
     /// core publishes for it.
-    fn messages_of(core: &mut Core, event: SystemEvent) -> Vec<(String, String)> {
+    fn messages_of(
+        core: &mut Core,
+        event: SystemEvent,
+    ) -> (Vec<(String, String)>, Option<oneshot::Sender<()>>) {
         let cfg = Config::parse(CFG).unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(event).unwrap();
         let mut msgs = Vec::new();
-        handle_event(&cfg, core, rx.try_recv().unwrap(), |m| {
+        let done = handle_event(&cfg, core, rx.try_recv().unwrap(), |m| {
             msgs.push((m.topic, m.payload))
         });
-        msgs
+        (msgs, done)
     }
 
     fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -368,10 +489,10 @@ enabled = false
     }
 
     #[test]
-    fn suspend_publishes_suspend_then_offline_and_completes_the_reply() {
+    fn suspend_publishes_suspend_then_offline_and_gives_back_the_reply() {
         let mut core = Core::new(&WITH_EVENTS, None);
-        let (queued, mut done) = tokio::sync::oneshot::channel();
-        let msgs = messages_of(&mut core, SystemEvent::Suspend { queued });
+        let (done, mut rx) = oneshot::channel();
+        let (msgs, reply) = messages_of(&mut core, SystemEvent::Suspend { done });
         assert_eq!(
             msgs,
             pairs(&[
@@ -382,13 +503,16 @@ enabled = false
                 ("homeassistant/sensor/JAHURTX-TEST/availability", "offline"),
             ])
         );
-        assert_eq!(done.try_recv(), Ok(()));
+        // The run loop completes the reply after the ack wait, not here.
+        assert!(rx.try_recv().is_err());
+        assert!(reply.is_some());
     }
 
     #[test]
     fn resume_publishes_resume_then_online() {
         let mut core = Core::new(&WITH_EVENTS, None);
-        let msgs = messages_of(&mut core, SystemEvent::Resume);
+        let (msgs, reply) = messages_of(&mut core, SystemEvent::Resume);
+        assert!(reply.is_none());
         assert_eq!(
             msgs,
             pairs(&[
@@ -405,12 +529,83 @@ enabled = false
     fn suspend_without_the_event_entity_publishes_only_offline() {
         static NO_EVENTS: [&Entity; 1] = [&entities::SESSIONSTATE];
         let mut core = Core::new(&NO_EVENTS, None);
-        let (queued, mut done) = tokio::sync::oneshot::channel();
-        let msgs = messages_of(&mut core, SystemEvent::Suspend { queued });
+        let (done, mut rx) = oneshot::channel();
+        let (msgs, reply) = messages_of(&mut core, SystemEvent::Suspend { done });
         assert_eq!(
             msgs,
             pairs(&[("homeassistant/sensor/JAHURTX-TEST/availability", "offline")])
         );
-        assert_eq!(done.try_recv(), Ok(()));
+        // The run loop completes the reply after the ack wait, not here.
+        assert!(rx.try_recv().is_err());
+        assert!(reply.is_some());
+    }
+
+    fn outgoing(pkid: u16) -> Event {
+        Event::Outgoing(Outgoing::Publish(pkid))
+    }
+
+    fn puback(pkid: u16) -> Event {
+        Event::Incoming(Incoming::PubAck(rumqttc::PubAck::new(pkid)))
+    }
+
+    #[test]
+    fn ack_wait_matches_the_ack_of_the_offline_publish_only() {
+        // Two publishes were still to be written before `offline`.
+        let mut wait = AckWait::new(2);
+        assert!(!wait.on_event(&outgoing(7)));
+        assert!(!wait.on_event(&outgoing(8)));
+        assert!(!wait.on_event(&puback(7)));
+        assert!(!wait.on_event(&outgoing(9)));
+        assert!(!wait.on_event(&outgoing(10)));
+        assert!(!wait.on_event(&puback(8)));
+        assert!(!wait.on_event(&puback(10)));
+        assert!(wait.on_event(&puback(9)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suspend_done_completes_when_offline_is_acknowledged() {
+        let mut suspend = SuspendWait::default();
+        let (done, mut rx) = tokio::sync::oneshot::channel();
+        suspend.start(done, Some(0), tokio::time::Instant::now());
+        suspend.on_event(&outgoing(3));
+        assert!(rx.try_recv().is_err());
+        suspend.on_event(&puback(3));
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(suspend.deadline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suspend_done_completes_after_2_s_without_an_ack() {
+        let mut suspend = SuspendWait::default();
+        let (done, mut rx) = tokio::sync::oneshot::channel();
+        let start = tokio::time::Instant::now();
+        suspend.start(done, Some(0), start);
+        assert_eq!(suspend.deadline(), Some(start + Duration::from_secs(2)));
+        suspend.on_event(&outgoing(3));
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        suspend.expire(tokio::time::Instant::now());
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        suspend.expire(tokio::time::Instant::now());
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(suspend.deadline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suspend_done_completes_at_once_when_not_connected() {
+        let mut suspend = SuspendWait::default();
+        let (done, mut rx) = tokio::sync::oneshot::channel();
+        suspend.start(done, None, tokio::time::Instant::now());
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(suspend.deadline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_connection_completes_the_suspend_at_once() {
+        let mut suspend = SuspendWait::default();
+        let (done, mut rx) = tokio::sync::oneshot::channel();
+        suspend.start(done, Some(1), tokio::time::Instant::now());
+        suspend.finish();
+        assert_eq!(rx.try_recv(), Ok(()));
     }
 }

@@ -82,6 +82,37 @@ pub fn gpu_sample(stats: &HashMap<String, i64>) -> Option<GpuSample> {
     })
 }
 
+/// `iokit_common_msg(x)` of IOMessage.h: `sys_iokit` is `err_system(0x38)`,
+/// that is `0x38 << 26`; `sub_iokit_common` is 0.
+const fn iokit_common_msg(message: u32) -> u32 {
+    (0x38 << 26) | message
+}
+
+pub const MESSAGE_CAN_SYSTEM_SLEEP: u32 = iokit_common_msg(0x270);
+pub const MESSAGE_SYSTEM_WILL_SLEEP: u32 = iokit_common_msg(0x280);
+pub const MESSAGE_SYSTEM_HAS_POWERED_ON: u32 = iokit_common_msg(0x300);
+
+/// What the power thread does for one message of `IORegisterForSystemPower`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PowerAction {
+    /// Idle sleep request: allow it at once.
+    AllowNow,
+    /// The system goes to sleep: publish `Suspend` and `offline`, then allow.
+    Suspend,
+    /// The system woke up: publish `Resume` and `online`.
+    Resume,
+    Ignore,
+}
+
+pub fn power_action(message: u32) -> PowerAction {
+    match message {
+        MESSAGE_CAN_SYSTEM_SLEEP => PowerAction::AllowNow,
+        MESSAGE_SYSTEM_WILL_SLEEP => PowerAction::Suspend,
+        MESSAGE_SYSTEM_HAS_POWERED_ON => PowerAction::Resume,
+        _ => PowerAction::Ignore,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +273,16 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn power_messages_map_to_their_actions() {
+        // The values of IOMessage.h: iokit_common_msg(x) = 0xe0000000 | x.
+        assert_eq!(power_action(0xe000_0270), PowerAction::AllowNow);
+        assert_eq!(power_action(0xe000_0280), PowerAction::Suspend);
+        assert_eq!(power_action(0xe000_0300), PowerAction::Resume);
+        // kIOMessageSystemWillPowerOn and kIOMessageSystemWillNotSleep.
+        assert_eq!(power_action(0xe000_0320), PowerAction::Ignore);
+        assert_eq!(power_action(0xe000_0290), PowerAction::Ignore);
     }
 }
