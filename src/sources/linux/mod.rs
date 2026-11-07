@@ -1,18 +1,37 @@
 //! The Linux sources.
 
 mod boot;
+mod drm;
+mod hyprland;
+mod logind;
 mod os;
+mod rules;
 
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::core::{SessionState, Snapshot, SystemEvent};
+use crate::core::{Snapshot, SystemEvent};
 use crate::entities::{self, Entity};
 
+use rules::{LockTracker, Session};
+
 /// The entities that the Linux sources supply.
-static SUPPLIED: [&Entity; 2] = [&entities::LASTBOOT, &entities::SESSIONSTATE];
+static SUPPLIED: [&Entity; 5] = [
+    &entities::LASTBOOT,
+    &entities::SESSIONSTATE,
+    &entities::LOGGEDUSERS,
+    &entities::DISPLAY,
+    &entities::LASTSYSTEMSTATECHANGE,
+];
+
+/// The source state of `sessionstate`: the last lock value.
+static LOCK: Mutex<LockTracker> = Mutex::new(LockTracker::new());
+
+static WARNED_SOCKET: AtomicBool = AtomicBool::new(false);
 
 pub fn supplied() -> &'static [&'static Entity] {
     &SUPPLIED
@@ -34,17 +53,46 @@ pub fn boot_time() -> Option<i64> {
     }
 }
 
-/// One snapshot. The session source comes in a later task; until then there
-/// is no session, so `sessionstate` is `Unknown`.
+/// One snapshot: the logind sessions, the Hyprland monitors of the active
+/// session and, without them, the DRM connectors.
 pub fn poll() -> Snapshot {
+    snapshot(
+        logind::sessions(),
+        Path::new(hyprland::RUN_USER),
+        Path::new(drm::DRM_DIR),
+    )
+}
+
+/// The snapshot from the logind session list (`None` before the first read)
+/// and the Hyprland and DRM directories.
+fn snapshot(sessions: Option<Vec<Session>>, run_user: &Path, drm_dir: &Path) -> Snapshot {
+    let active = sessions.as_deref().and_then(rules::active_session);
+    let monitors = active.and_then(|s| hyprland::monitors(run_user, s.uid));
+    if active.is_some() && monitors.is_none() && !WARNED_SOCKET.swap(true, Ordering::Relaxed) {
+        warn!("no answer from the Hyprland socket of the active session: sessionstate is Unlocked");
+    }
+    let display = match &monitors {
+        Some(list) => Some(rules::display_from_monitors(list)),
+        None => rules::display_from_drm(&drm::connectors(drm_dir)),
+    };
+    let session = sessions.as_ref().map(|_| {
+        let read = monitors.as_deref().map(rules::lock_read);
+        LOCK.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update(active.is_some(), read)
+    });
     Snapshot {
-        session: Some(SessionState::NoSession),
+        session,
+        users: sessions.as_deref().map(rules::logged_users),
+        display,
         ..Snapshot::default()
     }
 }
 
 /// The receiver of the sleep and wake events. No source sends them yet.
+/// Starts the logind task, so call it once, inside the tokio runtime.
 pub fn events() -> mpsc::Receiver<SystemEvent> {
+    logind::start();
     mpsc::channel(1).1
 }
 
@@ -53,16 +101,33 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::core::Core;
+    use crate::core::{Core, SessionState};
 
     #[test]
-    fn linux_publishes_lastboot_and_an_unknown_session() {
+    fn linux_publishes_five_entities() {
         let names: Vec<&str> = supplied().iter().map(|e| e.name).collect();
-        assert_eq!(names, ["lastboot", "sessionstate"]);
+        assert_eq!(
+            names,
+            [
+                "lastboot",
+                "sessionstate",
+                "loggedusers",
+                "display",
+                "lastsystemstatechange"
+            ]
+        );
 
         let now = Instant::now();
         let mut core = Core::new(supplied(), Some(1_787_892_895));
-        core.update(poll(), now);
+        core.update(
+            Snapshot {
+                session: Some(SessionState::Locked),
+                users: Some(vec!["bob".into(), "alice".into()]),
+                display: Some(false),
+                ..Snapshot::default()
+            },
+            now,
+        );
         let states: Vec<(&str, String)> = core
             .connect(now)
             .into_iter()
@@ -72,8 +137,30 @@ mod tests {
             states,
             [
                 ("lastboot", "2026-08-28 04:54:55Z".to_string()),
-                ("sessionstate", "Unknown".to_string())
+                ("sessionstate", "Locked".to_string()),
+                ("loggedusers", r#"["alice","bob"]"#.to_string()),
+                ("display", "OFF".to_string()),
+                ("lastsystemstatechange", "ApplicationStarted".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn before_the_first_logind_read_no_session_state_is_given() {
+        let none = Path::new("/nonexistent/pc-agent");
+        assert_eq!(snapshot(None, none, none), Snapshot::default());
+    }
+
+    #[test]
+    fn no_session_gives_unknown_no_users_and_no_display() {
+        let none = Path::new("/nonexistent/pc-agent");
+        assert_eq!(
+            snapshot(Some(Vec::new()), none, none),
+            Snapshot {
+                session: Some(SessionState::NoSession),
+                users: Some(Vec::new()),
+                ..Snapshot::default()
+            }
         );
     }
 }

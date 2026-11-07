@@ -21,7 +21,7 @@ tokio = { version = "1.54.1", features = ["test-util"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
 nvml-wrapper = "0.13.0"
-zbus = { version = "6.2.1", default-features = false, features = ["tokio"] }
+zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
