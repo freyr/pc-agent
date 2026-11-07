@@ -47,3 +47,64 @@ Run it on the target PC, twice:
    Lock the PC at once. Unlock it after 30 s.
 
 4. Send `probe-unlocked.txt` and `probe-locked.txt` to the maintainer.
+
+## Install on macOS
+
+The macOS agent runs as a LaunchDaemon. It publishes these entities: sessionstate, lastactive,
+lastboot, lastsystemstatechange, loggedusers and gpuload. The entities display and gpupower are
+not supplied on macOS.
+
+1. Get the binary. Use one of two ways.
+
+   Download `pc-agent-aarch64-macos.tar.gz` and its `.sha256` file from a release. Then check
+   the archive and unpack it:
+
+   ```sh
+   shasum -a 256 -c pc-agent-aarch64-macos.tar.gz.sha256
+   tar -xzf pc-agent-aarch64-macos.tar.gz
+   xattr -d com.apple.quarantine pc-agent
+   ```
+
+   Or build it from a clone of the repo:
+
+   ```sh
+   git clone https://github.com/freyr/pc-agent.git
+   cd pc-agent
+   cargo build --release
+   ```
+
+2. Install the service from the clone. The script builds as your user and installs as root:
+
+   ```sh
+   sudo scripts/install-macos.sh
+   ```
+
+   The script installs `/usr/local/bin/pc-agent` and `/Library/LaunchDaemons/pc-agent.plist`. It
+   creates `/etc/pc-agent/config.toml` from the example only if the file does not exist.
+
+3. Edit `/etc/pc-agent/config.toml`. Set the broker address, the user, the password and the
+   device names. The file has mode 0600 and belongs to root.
+
+   ```sh
+   sudo nano /etc/pc-agent/config.toml
+   ```
+
+4. Restart the service:
+
+   ```sh
+   sudo launchctl kickstart -k system/pc-agent
+   ```
+
+5. Check the service and read the log:
+
+   ```sh
+   sudo launchctl print system/pc-agent
+   tail -f /var/log/pc-agent.log
+   ```
+
+To uninstall, run the script with `--uninstall`. It stops the service and removes the plist and
+the binary. It keeps `/etc/pc-agent/config.toml`.
+
+```sh
+sudo scripts/install-macos.sh --uninstall
+```

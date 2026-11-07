@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Package the release binary for the x86_64 Linux release.
+# Package the release binary for the release of this OS and CPU.
 #
 # Usage: bash scripts/package.sh <output-dir>
-# Run `cargo build --release` first. Writes two files to <output-dir>:
-#   pc-agent-x86_64-linux.tar.gz         (pc-agent and README.md at the top level)
-#   pc-agent-x86_64-linux.tar.gz.sha256  (output of sha256sum)
+# Run `cargo build --release` first. The target name comes from the OS:
+#   Linux x86_64  -> x86_64-linux
+#   macOS arm64   -> aarch64-macos
+# Writes two files to <output-dir>:
+#   pc-agent-<target>.tar.gz         (pc-agent, README.md and packaging/config.example.toml;
+#                                     on macOS also packaging/pc-agent.plist)
+#   pc-agent-<target>.tar.gz.sha256  (checkable with sha256sum -c or shasum -a 256 -c)
 
 set -euo pipefail
 
@@ -13,16 +17,38 @@ if [[ $# -ne 1 ]]; then
   exit 1
 fi
 
+os="$(uname -s)"
+cpu="$(uname -m)"
+case "$os/$cpu" in
+  Linux/x86_64) target="x86_64-linux" ;;
+  Darwin/arm64) target="aarch64-macos" ;;
+  *)
+    echo "Unsupported platform: $os $cpu" >&2
+    exit 1
+    ;;
+esac
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$1"
 out="$(cd "$1" && pwd)"
-name="pc-agent-x86_64-linux.tar.gz"
+name="pc-agent-$target.tar.gz"
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
+mkdir "$stage/packaging"
 install -m 0755 "$root/target/release/pc-agent" "$stage/pc-agent"
 install -m 0644 "$root/README.md" "$stage/README.md"
+install -m 0644 "$root/packaging/config.example.toml" "$stage/packaging/config.example.toml"
+files=(pc-agent README.md packaging/config.example.toml)
+if [[ "$os" == "Darwin" ]]; then
+  install -m 0644 "$root/packaging/pc-agent.plist" "$stage/packaging/pc-agent.plist"
+  files+=(packaging/pc-agent.plist)
+fi
 
-tar -C "$stage" -czf "$out/$name" pc-agent README.md
-(cd "$out" && sha256sum "$name" > "$name.sha256")
+tar -C "$stage" -czf "$out/$name" "${files[@]}"
+if [[ "$os" == "Darwin" ]]; then
+  (cd "$out" && shasum -a 256 "$name" > "$name.sha256")
+else
+  (cd "$out" && sha256sum "$name" > "$name.sha256")
+fi

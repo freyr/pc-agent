@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  linux:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -27,4 +27,24 @@ jobs:
           path: |
             dist/pc-agent-x86_64-linux.tar.gz
             dist/pc-agent-x86_64-linux.tar.gz.sha256
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - run: bash scripts/package.sh dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pc-agent-aarch64-macos
+          path: |
+            dist/pc-agent-aarch64-macos.tar.gz
+            dist/pc-agent-aarch64-macos.tar.gz.sha256
           if-no-files-found: error
