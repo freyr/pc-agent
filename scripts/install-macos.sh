@@ -31,6 +31,14 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 unload() {
   # Ignore the error when the service is not loaded.
   launchctl bootout "system/$label" 2>/dev/null || true
+  # bootout returns before launchd has removed the service, and a bootstrap
+  # before that fails. Wait for the removal (the agent stops in about 2 s).
+  for _ in $(seq 1 50); do
+    launchctl print "system/$label" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  echo "The old service system/$label did not stop within 10 s." >&2
+  exit 1
 }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
