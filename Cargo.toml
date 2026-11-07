@@ -19,3 +19,10 @@ zbus = { version = "6.2.1", default-features = false, features = ["tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
+
+[profile.release]
+lto = true
+strip = true
+panic = "abort"
+opt-level = "s"
+codegen-units = 1
