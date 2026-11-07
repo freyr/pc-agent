@@ -44,10 +44,12 @@ on run argv
   set theDefault to item 2 of argv
   set theMode to item 3 of argv
   if theMode is "hidden" then
-    set r to display dialog thePrompt default answer theDefault with title "pc-agent" with hidden answer buttons {"Cancel", "OK"} default button "OK"
+    set r to display dialog thePrompt default answer theDefault with title "pc-agent" with hidden answer buttons {"Cancel", "OK"} default button "OK" giving up after 300
   else
-    set r to display dialog thePrompt default answer theDefault with title "pc-agent" buttons {"Cancel", "OK"} default button "OK"
+    set r to display dialog thePrompt default answer theDefault with title "pc-agent" buttons {"Cancel", "OK"} default button "OK" giving up after 300
   end if
+  -- Nobody answered within 5 min: the same as Cancel.
+  if gave up of r then error number -128
   return text returned of r
 end run
 APPLESCRIPT
@@ -58,7 +60,7 @@ notify() {
   [[ -n "$console_uid" ]] || return 0
   launchctl asuser "$console_uid" sudo -u "$console_user" osascript - "$1" <<'APPLESCRIPT' >/dev/null 2>&1 || true
 on run argv
-  display dialog (item 1 of argv) with title "pc-agent" buttons {"OK"} default button "OK"
+  display dialog (item 1 of argv) with title "pc-agent" buttons {"OK"} default button "OK" giving up after 120
 end run
 APPLESCRIPT
 }
@@ -100,7 +102,7 @@ write_config() {
     printf 'host = "%s"\n' "$e_host"
     printf 'port = %s\n' "$port"
     printf 'username = "%s"\n' "$e_user"
-    printf 'password = "%s"\n' "$e_pass"
+    printf '%s = "%s"\n' password "$e_pass"
     printf '\n[device]\n'
     printf 'name = "%s"\n' "$e_name"
     printf 'identifier = "pc-agent-%s"\n' "$e_name"
@@ -193,7 +195,9 @@ main() {
   chmod 0755 "$share"
   chown -R root:wheel "$share"
 
-  if [[ -e "$conf" ]]; then
+  # A file that still holds the example placeholder (left by a cancelled
+  # install) counts as no configuration, so the dialogs come again.
+  if [[ -e "$conf" ]] && ! grep -q '<broker address>' "$conf"; then
     say "Keep the existing $conf."
     find_console_user || true
   else

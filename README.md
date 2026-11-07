@@ -59,8 +59,8 @@ not supplied on macOS.
 1. Download `pc-agent-<version>-macos.pkg` from the latest release. The package is for Apple
    silicon.
 2. Double-click the package. The package is not signed, so macOS blocks it. Open System
-   Settings, then Privacy & Security. Click "Open Anyway" for the package. You can also
-   right-click the package and choose Open. Then follow the installer.
+   Settings, then Privacy & Security. Click "Open Anyway" for the package. Then follow the
+   installer.
 3. The installer asks for the MQTT broker address, the MQTT user, the MQTT password and the
    device name in dialogs. It writes `/etc/pc-agent/config.toml` with mode 0600 and starts the
    service. A last dialog shows if the agent connected to the broker.

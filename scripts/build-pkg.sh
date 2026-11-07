@@ -62,6 +62,20 @@ pkgbuild \
   --install-location / \
   "$tmp/pc-agent-component.pkg"
 
-productbuild --package "$tmp/pc-agent-component.pkg" "$out/$name"
+# The binary is arm64 only: restrict the product to Apple silicon.
+productbuild --synthesize --package "$tmp/pc-agent-component.pkg" "$tmp/distribution.xml"
+sed -i '' 's/hostArchitectures="[^"]*"/hostArchitectures="arm64"/' "$tmp/distribution.xml"
+grep -q 'hostArchitectures="arm64"' "$tmp/distribution.xml"
+productbuild --distribution "$tmp/distribution.xml" --package-path "$tmp" "$out/$name"
+
+# AppleDouble entries come from extended attributes that this Mac cannot
+# remove (com.apple.provenance). Fail in CI, warn on a local build.
+if grep -q '/\._' < <(pkgutil --payload-files "$out/$name"); then
+  if [[ -n "${CI:-}" ]]; then
+    echo "The payload has ._* entries." >&2
+    exit 1
+  fi
+  echo "Warning: the payload has ._* entries (local build). Use the CI package." >&2
+fi
 (cd "$out" && shasum -a 256 "$name" > "$name.sha256")
 echo "Built $out/$name"
