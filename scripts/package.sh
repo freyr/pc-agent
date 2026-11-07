@@ -7,7 +7,8 @@
 #   macOS arm64   -> aarch64-macos
 # Writes two files to <output-dir>:
 #   pc-agent-<target>.tar.gz         (pc-agent, README.md and packaging/config.example.toml;
-#                                     on macOS also packaging/pc-agent.plist)
+#                                     on macOS also packaging/pc-agent.plist and
+#                                     scripts/install-macos.sh)
 #   pc-agent-<target>.tar.gz.sha256  (checkable with sha256sum -c or shasum -a 256 -c)
 
 set -euo pipefail
@@ -44,6 +45,9 @@ files=(pc-agent README.md packaging/config.example.toml)
 if [[ "$os" == "Darwin" ]]; then
   install -m 0644 "$root/packaging/pc-agent.plist" "$stage/packaging/pc-agent.plist"
   files+=(packaging/pc-agent.plist)
+  mkdir "$stage/scripts"
+  install -m 0755 "$root/scripts/install-macos.sh" "$stage/scripts/install-macos.sh"
+  files+=(scripts/install-macos.sh)
 fi
 
 tar -C "$stage" -czf "$out/$name" "${files[@]}"

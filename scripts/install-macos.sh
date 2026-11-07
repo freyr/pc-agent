@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Build pc-agent and install it as a LaunchDaemon on macOS.
+# Install pc-agent as a LaunchDaemon on macOS: build it from a clone, or
+# take the prebuilt binary of an extracted release archive.
 #
 # Usage:
-#   sudo scripts/install-macos.sh              build and install
+#   sudo scripts/install-macos.sh              install (build first in a clone)
 #   sudo scripts/install-macos.sh --uninstall  stop the service, remove the plist and the binary
 #
 # The build runs as the calling user (SUDO_USER). The configuration file
@@ -44,16 +45,29 @@ if [[ $# -gt 0 ]]; then
   exit 1
 fi
 
-if ! sudo -u "$SUDO_USER" -i command -v cargo >/dev/null 2>&1; then
-  echo "User $SUDO_USER has no cargo in the login shell PATH. Install Rust (https://rustup.rs) first." >&2
+if [[ -f "$root/Cargo.toml" ]]; then
+  # A clone of the repo: build as the calling user, so target/ stays theirs.
+  if ! sudo -u "$SUDO_USER" -i command -v cargo >/dev/null 2>&1; then
+    echo "User $SUDO_USER has no cargo in the login shell PATH. Install Rust (https://rustup.rs) first." >&2
+    exit 1
+  fi
+  echo "Build as $SUDO_USER."
+  # sudo -i passes the command to a login shell, so no shell variable may be
+  # left for that shell to expand.
+  sudo -u "$SUDO_USER" -i cargo build --release --manifest-path "$root/Cargo.toml"
+  src="$root/target/release/pc-agent"
+elif [[ -f "$root/pc-agent" ]]; then
+  # An extracted release archive: install its prebuilt binary.
+  src="$root/pc-agent"
+else
+  echo "Found neither $root/Cargo.toml nor a prebuilt $root/pc-agent." >&2
   exit 1
 fi
 
-echo "Build as $SUDO_USER."
-sudo -u "$SUDO_USER" -i bash -c 'cd "$1" && cargo build --release' _ "$root"
-
 mkdir -p /usr/local/bin
-install -m 0755 -o root -g wheel "$root/target/release/pc-agent" "$bin"
+install -m 0755 -o root -g wheel "$src" "$bin"
+# A binary from a downloaded archive carries the Gatekeeper quarantine flag.
+xattr -d com.apple.quarantine "$bin" 2>/dev/null || true
 
 mkdir -p "$conf_dir"
 chown root:wheel "$conf_dir"

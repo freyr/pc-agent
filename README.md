@@ -54,26 +54,27 @@ The macOS agent runs as a LaunchDaemon. It publishes these entities: sessionstat
 lastboot, lastsystemstatechange, loggedusers and gpuload. The entities display and gpupower are
 not supplied on macOS.
 
-1. Get the binary. Use one of two ways.
+1. Get the files. Use one of two ways.
 
    Download `pc-agent-aarch64-macos.tar.gz` and its `.sha256` file from a release. Then check
-   the archive and unpack it:
+   the archive and unpack it into a new folder:
 
    ```sh
    shasum -a 256 -c pc-agent-aarch64-macos.tar.gz.sha256
-   tar -xzf pc-agent-aarch64-macos.tar.gz
-   xattr -d com.apple.quarantine pc-agent
+   mkdir pc-agent
+   tar -xzf pc-agent-aarch64-macos.tar.gz -C pc-agent
+   cd pc-agent
    ```
 
-   Or build it from a clone of the repo:
+   Or clone the repo. You need Rust (https://rustup.rs) for this way:
 
    ```sh
    git clone https://github.com/freyr/pc-agent.git
    cd pc-agent
-   cargo build --release
    ```
 
-2. Install the service from the clone. The script builds as your user and installs as root:
+2. Install the service. In a clone, the script builds as your user first. In an unpacked
+   archive, it installs the prebuilt binary and removes the Gatekeeper quarantine flag:
 
    ```sh
    sudo scripts/install-macos.sh
