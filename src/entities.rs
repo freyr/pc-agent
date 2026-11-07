@@ -10,7 +10,6 @@ const LIVE_EXPIRE_AFTER: u32 = 120;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Component {
     Sensor,
-    #[allow(dead_code)]
     BinarySensor,
 }
 
@@ -25,7 +24,7 @@ impl Component {
 
 /// One Home Assistant entity that pc-agent can publish under
 /// `homeassistant/<component>/<device name>/<name>/`. The table `ENTITIES` is
-/// data: which entities the agent publishes depends on the sources that exist.
+/// data: the agent publishes the entities that the source of the running OS supplies.
 pub struct Entity {
     pub name: &'static str,
     pub component: Component,
@@ -56,8 +55,6 @@ const fn sensor(name: &'static str, icon: &'static str) -> Entity {
 
 pub const SESSIONSTATE: Entity = sensor("sessionstate", "mdi:lock");
 
-// No source supplies this entity yet; the allow goes when a task adds it to PUBLISHED.
-#[allow(dead_code)]
 pub const LASTACTIVE: Entity = Entity {
     device_class: Some("timestamp"),
     ..sensor("lastactive", "mdi:clock-time-three-outline")
@@ -68,12 +65,8 @@ pub const LASTBOOT: Entity = Entity {
     ..sensor("lastboot", "mdi:clock-time-three-outline")
 };
 
-// No source supplies this entity yet; the allow goes when a task adds it to PUBLISHED.
-#[allow(dead_code)]
 pub const LASTSYSTEMSTATECHANGE: Entity = sensor("lastsystemstatechange", "mdi:cog");
 
-// No source supplies this entity yet; the allow goes when a task adds it to PUBLISHED.
-#[allow(dead_code)]
 pub const GPULOAD: Entity = Entity {
     unit: Some("%"),
     state_class: Some("measurement"),
@@ -82,8 +75,6 @@ pub const GPULOAD: Entity = Entity {
     ..sensor("gpuload", "mdi:expansion-card")
 };
 
-// No source supplies this entity yet; the allow goes when a task adds it to PUBLISHED.
-#[allow(dead_code)]
 pub const GPUPOWER: Entity = Entity {
     unit: Some("W"),
     device_class: Some("power"),
@@ -93,16 +84,12 @@ pub const GPUPOWER: Entity = Entity {
     ..sensor("gpupower", "mdi:flash")
 };
 
-// No source supplies this entity yet; the allow goes when a task adds it to PUBLISHED.
-#[allow(dead_code)]
 pub const LOGGEDUSERS: Entity = Entity {
     expire_after: Some(LIVE_EXPIRE_AFTER),
     default_entity_id: true,
     ..sensor("loggedusers", "mdi:account-group")
 };
 
-// No source supplies this entity yet; the allow goes when a task adds it to PUBLISHED.
-#[allow(dead_code)]
 pub const DISPLAY: Entity = Entity {
     component: Component::BinarySensor,
     payloads: Some(("ON", "OFF")),
@@ -112,7 +99,7 @@ pub const DISPLAY: Entity = Entity {
 };
 
 /// The entity table of the spec.
-// Read by the tests; the agent publishes the entities of PUBLISHED.
+// Read by the tests; the agent publishes the entities that the source supplies.
 #[allow(dead_code)]
 pub const ENTITIES: [Entity; 8] = [
     SESSIONSTATE,
@@ -124,10 +111,6 @@ pub const ENTITIES: [Entity; 8] = [
     LOGGEDUSERS,
     DISPLAY,
 ];
-
-/// The entities that have a source today. A task that adds a source adds its
-/// entity here.
-pub const PUBLISHED: [&Entity; 2] = [&LASTBOOT, &SESSIONSTATE];
 
 /// The availability topic is under `sensor` for every entity, also for a binary sensor.
 pub fn availability_topic(device: &str) -> String {
@@ -430,11 +413,5 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
                 assert!(!t.starts_with("hass.agent/"), "{t}");
             }
         }
-    }
-
-    #[test]
-    fn published_entities_are_the_ones_with_a_source() {
-        let names: Vec<&str> = PUBLISHED.iter().map(|e| e.name).collect();
-        assert_eq!(names, ["lastboot", "sessionstate"]);
     }
 }

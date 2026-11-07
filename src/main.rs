@@ -1,19 +1,20 @@
 mod config;
+mod core;
 mod entities;
 mod mqtt;
 mod sources;
 mod time;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Result, bail};
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::entities::Entity;
+use crate::core::Core;
 
 const USAGE: &str = "\
 Usage: pc-agent [--config <path>]
@@ -87,7 +88,8 @@ fn run(config_path: PathBuf) -> Result<()> {
         "starting pc-agent"
     );
 
-    let model = sources::os::read_model(Path::new(sources::os::VERSION_PATH));
+    let model = sources::model();
+    let core = Core::new(sources::supplied(), sources::boot_time());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -100,19 +102,8 @@ fn run(config_path: PathBuf) -> Result<()> {
                 _ = sigint.recv() => info!("SIGINT received"),
             }
         };
-        mqtt::run(&cfg, &model, current_states, stop).await
+        mqtt::run(&cfg, &model, core, sources::poll, sources::events(), stop).await
     })
-}
-
-/// The states published at each connect.
-fn current_states() -> Vec<(&'static Entity, String)> {
-    let mut states = Vec::new();
-    match sources::boot::read_btime() {
-        Ok(btime) => states.push((&entities::LASTBOOT, time::format_timestamp(btime))),
-        Err(e) => warn!("no lastboot state: {e:#}"),
-    }
-    states.push((&entities::SESSIONSTATE, "Unknown".to_string()));
-    states
 }
 
 #[cfg(test)]

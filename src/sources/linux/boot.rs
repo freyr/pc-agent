@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 const PROC_STAT: &str = "/proc/stat";
 
 /// Reads the boot time (seconds since the epoch) from `/proc/stat`.
-/// On a system without `/proc/stat` (macOS) this returns an error.
+/// Without a readable `/proc/stat` this returns an error.
 pub fn read_btime() -> Result<i64> {
     let text =
         std::fs::read_to_string(PROC_STAT).with_context(|| format!("cannot read {PROC_STAT}"))?;
