@@ -66,7 +66,13 @@ pkgbuild \
 productbuild --synthesize --package "$tmp/pc-agent-component.pkg" "$tmp/distribution.xml"
 sed -i '' 's/hostArchitectures="[^"]*"/hostArchitectures="arm64"/' "$tmp/distribution.xml"
 grep -q 'hostArchitectures="arm64"' "$tmp/distribution.xml"
-productbuild --distribution "$tmp/distribution.xml" --package-path "$tmp" "$out/$name"
+# The last installer screen: how to check the agent.
+sed -i '' 's#</installer-gui-script>#<title>pc-agent</title><conclusion file="conclusion.html" mime-type="text/html"/></installer-gui-script>#' "$tmp/distribution.xml"
+grep -q '<conclusion file="conclusion.html"' "$tmp/distribution.xml"
+mkdir "$tmp/resources"
+install -m 0644 "$root/packaging/macos/resources/conclusion.html" "$tmp/resources/conclusion.html"
+xattr -cr "$tmp/resources"
+productbuild --distribution "$tmp/distribution.xml" --resources "$tmp/resources" --package-path "$tmp" "$out/$name"
 
 # AppleDouble entries come from extended attributes that this Mac cannot
 # remove (com.apple.provenance). Fail in CI, warn on a local build.

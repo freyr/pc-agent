@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<style>
+  body { font: 13px -apple-system, sans-serif; line-height: 1.45; margin: 0 4px; }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  h2 { font-size: 13px; margin: 14px 0 4px; }
+  p, ul { margin: 0 0 6px; }
+  ul { padding-left: 18px; }
+  code { font: 12px ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<h1>pc-agent is installed</h1>
+<p>The service runs now, unless you cancelled a dialog. In Home Assistant, the device shows the
+event <code>ApplicationStarted</code> within a few seconds.</p>
+<p>If the agent could not start or connect, a dialog told you so.</p>
+
+<h2>Check the agent</h2>
+<ul>
+  <li>Log: <code>tail -f /var/log/pc-agent.log</code></li>
+  <li>Service: <code>sudo launchctl print system/pc-agent</code></li>
+</ul>
+
+<h2>If you cancelled a dialog</h2>
+<p>The installer wrote the example configuration and did not start the service.</p>
+<ul>
+  <li>Edit <code>/etc/pc-agent/config.toml</code> (broker address, user, password, device names).</li>
+  <li>Start the service: <code>sudo launchctl bootstrap system /Library/LaunchDaemons/pc-agent.plist</code></li>
+</ul>
+
+<h2>Uninstall</h2>
+<p><code>sudo /usr/local/share/pc-agent/uninstall.sh</code> (add <code>--purge</code> to remove the
+configuration and the log too).</p>
+</body>
+</html>

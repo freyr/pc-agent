@@ -63,7 +63,8 @@ not supplied on macOS.
    installer.
 3. The installer asks for the MQTT broker address, the MQTT user, the MQTT password and the
    device name in dialogs. It writes `/etc/pc-agent/config.toml` with mode 0600 and starts the
-   service. A last dialog shows if the agent connected to the broker.
+   service. The last installer screen tells how to check the agent. A dialog shows only if the
+   agent did not connect to the broker within 10 s.
 4. An upgrade keeps the existing configuration. The installer asks no questions then.
 5. If nobody is logged in, or you cancel a dialog, the installer writes the example
    configuration and does not start the service. Edit `/etc/pc-agent/config.toml`. Then run

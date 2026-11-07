@@ -216,7 +216,7 @@ main() {
     say "Wrote $conf."
   fi
 
-  local size=0 appended result
+  local size=0 appended
   [[ -f "$log" ]] && size="$(stat -f%z "$log")"
   if ! launchctl bootstrap system "$plist"; then
     say "The service did not start. Run: sudo launchctl bootstrap system $plist"
@@ -224,19 +224,20 @@ main() {
     return 0
   fi
 
-  result="not connected yet. See $log"
+  # The last installer screen covers the normal case; a dialog shows only
+  # when the agent did not connect.
   for _ in $(seq 1 50); do
     if [[ -f "$log" ]]; then
       appended="$(tail -c +"$((size + 1))" "$log" 2>/dev/null || true)"
       if [[ "$appended" == *"connected to broker"* ]]; then
-        result="connected to the broker"
-        break
+        say "The agent is connected to the broker."
+        return 0
       fi
     fi
     sleep 0.2
   done
-  say "The agent is $result."
-  notify "The agent is $result."
+  say "The agent is not connected yet. See $log"
+  notify "The agent is not connected yet. See $log"
   return 0
 }
 
