@@ -300,19 +300,24 @@ where
     // After a connection error: the time of the next connect attempt.
     let mut retry_at: Option<tokio::time::Instant> = None;
     let mut suspend = SuspendWait::default();
+    // Between Suspend and Resume the tick is off: the OS locks the screen as it
+    // goes to sleep, and a SessionLock must not replace the Suspend state.
+    // A connect also ends it, in case the Resume never comes.
+    let mut asleep = false;
 
     loop {
         tokio::select! {
             _ = &mut stop => break,
             _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)),
                 if retry_at.is_some() => retry_at = None,
-            _ = poll_tick.tick(), if connected => {
+            _ = poll_tick.tick(), if connected && !asleep => {
                 let states = core.update(poll(), Instant::now());
                 if connected {
                     session.publish_states(cfg, states);
                 }
             }
             Some(event) = events.recv() => {
+                asleep = matches!(event, SystemEvent::Suspend { .. });
                 // `true` when the last publish (`offline` of a Suspend) is queued.
                 let mut last_queued = false;
                 let done = handle_event(cfg, &mut core, event, |msg| {
@@ -330,6 +335,7 @@ where
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!(host = %cfg.mqtt.host, port = cfg.mqtt.port, "connected to broker");
                     connected = true;
+                    asleep = false;
                     // rumqttc clears its pending queue at a clean-session connect.
                     session.queued = 0;
                     session.sent = 0;
