@@ -2,6 +2,7 @@
 
 mod boot;
 mod drm;
+mod gpu;
 mod hyprland;
 mod input;
 mod logind;
@@ -20,8 +21,20 @@ use crate::entities::{self, Entity};
 
 use rules::{LockTracker, Session};
 
-/// The entities that the Linux sources supply.
-static SUPPLIED: [&Entity; 6] = [
+/// The entities that the Linux sources supply with the GPU on.
+static SUPPLIED: [&Entity; 8] = [
+    &entities::LASTBOOT,
+    &entities::SESSIONSTATE,
+    &entities::LOGGEDUSERS,
+    &entities::DISPLAY,
+    &entities::LASTACTIVE,
+    &entities::GPULOAD,
+    &entities::GPUPOWER,
+    &entities::LASTSYSTEMSTATECHANGE,
+];
+
+/// The entities with the GPU off (`[gpu] enabled = false`).
+static SUPPLIED_NO_GPU: [&Entity; 6] = [
     &entities::LASTBOOT,
     &entities::SESSIONSTATE,
     &entities::LOGGEDUSERS,
@@ -35,8 +48,8 @@ static LOCK: Mutex<LockTracker> = Mutex::new(LockTracker::new());
 
 static WARNED_SOCKET: AtomicBool = AtomicBool::new(false);
 
-pub fn supplied() -> &'static [&'static Entity] {
-    &SUPPLIED
+pub fn supplied(gpu: bool) -> &'static [&'static Entity] {
+    if gpu { &SUPPLIED } else { &SUPPLIED_NO_GPU }
 }
 
 /// The device model: the Omarchy version, or `Linux`.
@@ -56,10 +69,12 @@ pub fn boot_time() -> Option<i64> {
 }
 
 /// One snapshot: the logind sessions, the Hyprland monitors of the active
-/// session and, without them, the DRM connectors, and the last input time.
-pub fn poll() -> Snapshot {
+/// session and, without them, the DRM connectors, the last input time and,
+/// with `gpu`, the NVML sample.
+pub fn poll(gpu: bool) -> Snapshot {
     Snapshot {
         last_input: input::last_input(),
+        gpu: if gpu { gpu::sample() } else { None },
         ..snapshot(
             logind::sessions(),
             Path::new(hyprland::RUN_USER),
@@ -120,11 +135,31 @@ mod tests {
     use super::*;
     use crate::core::{Core, SessionState};
 
+    fn names(gpu: bool) -> Vec<&'static str> {
+        supplied(gpu).iter().map(|e| e.name).collect()
+    }
+
     #[test]
-    fn linux_publishes_six_entities() {
-        let names: Vec<&str> = supplied().iter().map(|e| e.name).collect();
+    fn linux_with_the_gpu_supplies_eight_entities() {
         assert_eq!(
-            names,
+            names(true),
+            [
+                "lastboot",
+                "sessionstate",
+                "loggedusers",
+                "display",
+                "lastactive",
+                "gpuload",
+                "gpupower",
+                "lastsystemstatechange"
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_publishes_six_entities_without_the_gpu() {
+        assert_eq!(
+            names(false),
             [
                 "lastboot",
                 "sessionstate",
@@ -136,7 +171,7 @@ mod tests {
         );
 
         let now = Instant::now();
-        let mut core = Core::new(supplied(), Some(1_787_892_895));
+        let mut core = Core::new(supplied(false), Some(1_787_892_895));
         core.update(
             Snapshot {
                 session: Some(SessionState::Locked),

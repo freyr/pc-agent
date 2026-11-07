@@ -1,5 +1,7 @@
 //! The sources of the running OS. Each OS module gives the same interface to
-//! the core: `supplied()`, `model()`, `boot_time()`, `poll()` and `events()`.
+//! the core: `supplied(gpu)`, `model()`, `boot_time()`, `poll(gpu)` and
+//! `events()`. `gpu` is `[gpu] enabled` of the configuration: when it is
+//! `false`, the source supplies no GPU entities and reads no GPU.
 
 #[cfg(target_os = "linux")]
 mod linux;

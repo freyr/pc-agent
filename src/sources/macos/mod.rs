@@ -26,6 +26,15 @@ static SUPPLIED: [&Entity; 6] = [
     &entities::LOGGEDUSERS,
 ];
 
+/// The entities with the GPU off (`[gpu] enabled = false`).
+static SUPPLIED_NO_GPU: [&Entity; 5] = [
+    &entities::SESSIONSTATE,
+    &entities::LASTACTIVE,
+    &entities::LASTBOOT,
+    &entities::LASTSYSTEMSTATECHANGE,
+    &entities::LOGGEDUSERS,
+];
+
 /// The source state of `lastactive`.
 static INPUT: Mutex<InputTracker> = Mutex::new(InputTracker::new());
 
@@ -40,8 +49,8 @@ fn warn_once(flag: &AtomicBool, message: &str) {
     }
 }
 
-pub fn supplied() -> &'static [&'static Entity] {
-    &SUPPLIED
+pub fn supplied(gpu: bool) -> &'static [&'static Entity] {
+    if gpu { &SUPPLIED } else { &SUPPLIED_NO_GPU }
 }
 
 /// The device model: `macOS <version>`.
@@ -62,7 +71,7 @@ pub fn boot_time() -> Option<i64> {
 }
 
 /// One snapshot: the console list, the HID idle time and the GPU statistics.
-pub fn poll() -> Snapshot {
+pub fn poll(gpu: bool) -> Snapshot {
     let (session, users) = match iokit::console_sessions() {
         Some(list) => (
             Some(rules::session_state(&list)),
@@ -88,10 +97,15 @@ pub fn poll() -> Snapshot {
         }
     };
 
-    let gpu = iokit::gpu_stats().and_then(|stats| rules::gpu_sample(&stats));
-    if gpu.is_none() {
-        warn_once(&WARNED_GPU, "no GPU utilization from IOAccelerator");
-    }
+    let gpu = if gpu {
+        let sample = iokit::gpu_stats().and_then(|stats| rules::gpu_sample(&stats));
+        if sample.is_none() {
+            warn_once(&WARNED_GPU, "no GPU utilization from IOAccelerator");
+        }
+        sample
+    } else {
+        None
+    };
 
     Snapshot {
         session,
@@ -119,7 +133,7 @@ mod tests {
 
     #[test]
     fn macos_publishes_six_entities() {
-        let names: Vec<&str> = supplied().iter().map(|e| e.name).collect();
+        let names: Vec<&str> = supplied(true).iter().map(|e| e.name).collect();
         assert_eq!(
             names,
             [
@@ -133,7 +147,7 @@ mod tests {
         );
 
         let now = Instant::now();
-        let mut core = Core::new(supplied(), Some(1_787_892_895));
+        let mut core = Core::new(supplied(true), Some(1_787_892_895));
         core.update(
             Snapshot {
                 session: Some(SessionState::Unlocked),
@@ -161,6 +175,21 @@ mod tests {
                 ("lastsystemstatechange", "ApplicationStarted".to_string()),
                 ("gpuload", "27".to_string()),
                 ("loggedusers", r#"["alice"]"#.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_without_the_gpu_supplies_no_gpuload() {
+        let names: Vec<&str> = supplied(false).iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            [
+                "sessionstate",
+                "lastactive",
+                "lastboot",
+                "lastsystemstatechange",
+                "loggedusers"
             ]
         );
     }

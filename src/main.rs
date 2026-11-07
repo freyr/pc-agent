@@ -89,7 +89,8 @@ fn run(config_path: PathBuf) -> Result<()> {
     );
 
     let model = sources::model();
-    let core = Core::new(sources::supplied(), sources::boot_time());
+    let gpu = cfg.gpu.enabled;
+    let core = Core::new(sources::supplied(gpu), sources::boot_time());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -102,7 +103,8 @@ fn run(config_path: PathBuf) -> Result<()> {
                 _ = sigint.recv() => info!("SIGINT received"),
             }
         };
-        mqtt::run(&cfg, &model, core, sources::poll, sources::events(), stop).await
+        let poll = move || sources::poll(gpu);
+        mqtt::run(&cfg, &model, core, poll, sources::events(), stop).await
     })
 }
 

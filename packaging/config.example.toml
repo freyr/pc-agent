@@ -15,4 +15,7 @@ identifier = "pc-agent-<DEVICE>-TEST"
 entity_prefix = "<device>_test"
 
 # The [unique_ids] section is only for taking over the entities of HASS.Agent.
-# The [gpu] section is optional. The GPU is on when it is absent.
+
+# Set enabled = false to turn off the GPU entities. Without this section the GPU is on.
+[gpu]
+enabled = true

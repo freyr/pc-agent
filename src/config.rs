@@ -152,6 +152,13 @@ enabled = true
     }
 
     #[test]
+    fn gpu_can_be_turned_off() {
+        let text = FULL.replace("[gpu]\nenabled = true\n", "[gpu]\nenabled = false\n");
+        let c = Config::parse(&text).unwrap();
+        assert!(!c.gpu.enabled);
+    }
+
+    #[test]
     fn debug_output_hides_password() {
         let c = Config::parse(FULL).unwrap();
         let text = format!("{c:?}");
