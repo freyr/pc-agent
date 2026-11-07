@@ -58,27 +58,22 @@ pub fn start(events: mpsc::Sender<SystemEvent>) {
 fn run(events: mpsc::Sender<SystemEvent>) {
     // The thread and its registration live for the whole process, so this
     // one-time leak is intentional: the callback uses the state until exit.
-    let state: &'static mut PowerState = Box::leak(Box::new(PowerState {
+    let state: *mut PowerState = Box::into_raw(Box::new(PowerState {
         root_port: 0,
         events,
     }));
     let mut port: IONotificationPortRef = ptr::null_mut();
     let mut notifier: io_object_t = 0;
     // SAFETY: valid out pointers; `refcon` points to the leaked state.
-    let root_port = unsafe {
-        IORegisterForSystemPower(
-            ptr::from_mut(state).cast(),
-            &mut port,
-            callback,
-            &mut notifier,
-        )
-    };
+    let root_port =
+        unsafe { IORegisterForSystemPower(state.cast(), &mut port, callback, &mut notifier) };
     if root_port == 0 {
         warn!("cannot register for system power notifications: no Suspend and Resume");
         return;
     }
     // The callback runs only on this thread's run loop, which starts below.
-    state.root_port = root_port;
+    // SAFETY: `state` is the live allocation above; no reference to it exists.
+    unsafe { (*state).root_port = root_port };
 
     // SAFETY: `port` is the valid port of the registration; the source follows
     // the get rule (the port owns it).

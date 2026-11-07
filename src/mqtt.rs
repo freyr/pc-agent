@@ -247,8 +247,8 @@ impl Session {
         }
     }
 
-    /// The queued publishes that are not written yet. Saturating: a resend
-    /// after a reconnect also counts as written.
+    /// The queued publishes that are not written yet. The counters restart at
+    /// each ConnAck, because a clean-session reconnect drops the unsent queue.
     fn backlog(&self) -> usize {
         self.queued.saturating_sub(self.sent)
     }
@@ -330,6 +330,9 @@ where
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!(host = %cfg.mqtt.host, port = cfg.mqtt.port, "connected to broker");
                     connected = true;
+                    // rumqttc clears its pending queue at a clean-session connect.
+                    session.queued = 0;
+                    session.sent = 0;
                     // The tick was off while disconnected: take a fresh snapshot.
                     core.update(poll(), Instant::now());
                     let states = core.connect(Instant::now());
