@@ -7,7 +7,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::entities::{self, SENSORS};
+use crate::entities::{self, Entity, PUBLISHED};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// Capacity of the request channel. Larger than the burst of one connect, so
@@ -45,23 +45,23 @@ pub fn options(cfg: &Config) -> MqttOptions {
     opts
 }
 
-/// The messages of each (re)connect: all discovery configs, then `online`,
-/// then the given states.
-pub fn connect_messages(cfg: &Config, states: &[(&str, String)]) -> Vec<Message> {
+/// The messages of each (re)connect: the discovery configs of the published
+/// entities, then `online`, then the given states.
+pub fn connect_messages(cfg: &Config, model: &str, states: &[(&Entity, String)]) -> Vec<Message> {
     let device = &cfg.device.name;
-    let mut msgs: Vec<Message> = SENSORS
+    let mut msgs: Vec<Message> = PUBLISHED
         .iter()
-        .map(|s| Message {
-            topic: entities::config_topic(device, s.name),
-            payload: entities::discovery_payload(cfg, s).to_string(),
+        .map(|e| Message {
+            topic: entities::config_topic(device, e),
+            payload: entities::discovery_payload(cfg, e, model).to_string(),
         })
         .collect();
     msgs.push(Message {
         topic: entities::availability_topic(device),
         payload: ONLINE.to_string(),
     });
-    msgs.extend(states.iter().map(|(name, value)| Message {
-        topic: entities::state_topic(device, name),
+    msgs.extend(states.iter().map(|(entity, value)| Message {
+        topic: entities::state_topic(device, entity),
         payload: value.clone(),
     }));
     msgs
@@ -97,10 +97,11 @@ impl Session {
 }
 
 /// Runs the agent until `stop` completes, then publishes `offline` and disconnects.
-/// `states` gives the current states at each connect.
-pub async fn run<S, F>(cfg: &Config, states: S, stop: F) -> Result<()>
+/// `model` is the device model of the discovery configs; `states` gives the
+/// current states at each connect.
+pub async fn run<S, F>(cfg: &Config, model: &str, states: S, stop: F) -> Result<()>
 where
-    S: Fn() -> Vec<(&'static str, String)>,
+    S: Fn() -> Vec<(&'static Entity, String)>,
     F: Future<Output = ()>,
 {
     let (client, eventloop) = AsyncClient::new(options(cfg), CHANNEL_CAP);
@@ -118,7 +119,7 @@ where
             event = session.eventloop.poll() => match event {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!(host = %cfg.mqtt.host, port = cfg.mqtt.port, "connected to broker");
-                    for msg in connect_messages(cfg, &states()) {
+                    for msg in connect_messages(cfg, model, &states()) {
                         session.publish(msg);
                     }
                 }
@@ -236,9 +237,10 @@ enabled = false
         let cfg = Config::parse(CFG).unwrap();
         let msgs = connect_messages(
             &cfg,
+            "3.1.0",
             &[
-                ("lastboot", "2026-08-28 04:54:55Z".to_string()),
-                ("sessionstate", "Unknown".to_string()),
+                (&entities::LASTBOOT, "2026-08-28 04:54:55Z".to_string()),
+                (&entities::SESSIONSTATE, "Unknown".to_string()),
             ],
         );
         let topics: Vec<&str> = msgs.iter().map(|m| m.topic.as_str()).collect();
@@ -257,5 +259,6 @@ enabled = false
         assert_eq!(msgs[4].payload, "Unknown");
         let config: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
         assert_eq!(config["name"], "lastboot");
+        assert_eq!(config["device"]["model"], "3.1.0");
     }
 }

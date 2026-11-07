@@ -13,6 +13,7 @@ pub struct Config {
     pub device: Device,
     #[serde(default)]
     pub unique_ids: HashMap<String, String>,
+    #[serde(default)]
     pub gpu: Gpu,
 }
 
@@ -46,6 +47,13 @@ pub struct Device {
 #[derive(Debug, Deserialize)]
 pub struct Gpu {
     pub enabled: bool,
+}
+
+// The `[gpu]` section is optional; the GPU is on when it is absent.
+impl Default for Gpu {
+    fn default() -> Self {
+        Gpu { enabled: true }
+    }
 }
 
 impl Config {
@@ -125,6 +133,13 @@ enabled = true
             c.unique_id("sessionstate"),
             "pc-agent-JAHURTX-TEST-sessionstate"
         );
+    }
+
+    #[test]
+    fn gpu_section_is_optional_and_on_by_default() {
+        let text = FULL.replace("[gpu]\nenabled = true\n", "");
+        let c = Config::parse(&text).unwrap();
+        assert!(c.gpu.enabled);
     }
 
     #[test]
