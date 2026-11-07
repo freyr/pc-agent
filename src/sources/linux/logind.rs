@@ -106,16 +106,29 @@ async fn run() {
     }
 }
 
+/// `true` when the error says that the session object is gone: the session
+/// ended between `ListSessions` and the property read.
+fn session_gone(e: &zbus::Error) -> bool {
+    match e {
+        zbus::Error::FDO(fdo) => matches!(**fdo, zbus::fdo::Error::UnknownObject(_)),
+        zbus::Error::MethodError(name, _, _) => {
+            name.as_str() == "org.freedesktop.DBus.Error.UnknownObject"
+        }
+        _ => false,
+    }
+}
+
 /// All sessions of `ListSessions` with their properties. A session that goes
 /// away during the read is left out.
 async fn read(conn: &Connection) -> zbus::Result<Vec<Session>> {
     let manager = ManagerProxy::new(conn).await?;
     let mut list = Vec::new();
     for (_id, uid, user, _seat, path) in manager.list_sessions().await? {
-        let Ok(session) = properties(conn, path).await else {
-            continue;
+        let (class, kind, remote, active) = match properties(conn, path).await {
+            Ok(props) => props,
+            Err(e) if session_gone(&e) => continue,
+            Err(e) => return Err(e),
         };
-        let (class, kind, remote, active) = session;
         list.push(Session {
             uid,
             user,
@@ -158,6 +171,21 @@ mod tests {
             remote: false,
             active: true,
         }
+    }
+
+    #[test]
+    fn only_an_unknown_object_error_is_a_gone_session() {
+        let gone = zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownObject(
+            "Unknown object '/org/freedesktop/login1/session/_32'.".into(),
+        )));
+        assert!(session_gone(&gone));
+
+        let failed = zbus::Error::FDO(Box::new(zbus::fdo::Error::Failed("busy".into())));
+        assert!(!session_gone(&failed));
+        let timeout = zbus::Error::FDO(Box::new(zbus::fdo::Error::NoReply("timeout".into())));
+        assert!(!session_gone(&timeout));
+        let io = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::other("reset")));
+        assert!(!session_gone(&io));
     }
 
     #[test]
