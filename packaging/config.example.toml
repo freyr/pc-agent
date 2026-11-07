@@ -1,0 +1,18 @@
+# pc-agent configuration. Install it as /etc/pc-agent/config.toml (mode 0600, owner root).
+# Replace every value in <angle brackets> before you start the agent.
+
+[mqtt]
+host = "<broker address>"
+port = 1883
+username = "<user>"
+password = "<password>"
+
+[device]
+# Replace <DEVICE> with the host name of this PC, and <device> with its lower-case form.
+# The "-TEST" suffix keeps the entities apart from the entities of HASS.Agent.
+name = "<DEVICE>-TEST"
+identifier = "pc-agent-<DEVICE>-TEST"
+entity_prefix = "<device>_test"
+
+# The [unique_ids] section is only for taking over the entities of HASS.Agent.
+# The [gpu] section is optional. The GPU is on when it is absent.

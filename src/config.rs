@@ -100,6 +100,15 @@ enabled = true
 "#;
 
     #[test]
+    fn parses_packaged_example_config() {
+        let c = Config::parse(include_str!("../packaging/config.example.toml")).unwrap();
+        assert_eq!(c.mqtt.port, 1883);
+        assert_eq!(c.device.name, "<DEVICE>-TEST");
+        assert!(c.unique_ids.is_empty());
+        assert!(c.gpu.enabled);
+    }
+
+    #[test]
     fn parses_full_file() {
         let c = Config::parse(FULL).unwrap();
         assert_eq!(c.mqtt.host, "broker.example");
