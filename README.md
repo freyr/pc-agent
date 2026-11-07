@@ -54,6 +54,28 @@ The macOS agent runs as a LaunchDaemon. It publishes these entities: sessionstat
 lastboot, lastsystemstatechange, loggedusers and gpuload. The entities display and gpupower are
 not supplied on macOS.
 
+### Recommended: the installer package
+
+1. Download `pc-agent-<version>-macos.pkg` from the latest release. The package is for Apple
+   silicon.
+2. Double-click the package. The package is not signed, so macOS blocks it. Open System
+   Settings, then Privacy & Security. Click "Open Anyway" for the package. You can also
+   right-click the package and choose Open. Then follow the installer.
+3. The installer asks for the MQTT broker address, the MQTT user, the MQTT password and the
+   device name in dialogs. It writes `/etc/pc-agent/config.toml` with mode 0600 and starts the
+   service. A last dialog shows if the agent connected to the broker.
+4. An upgrade keeps the existing configuration. The installer asks no questions then.
+5. If nobody is logged in, or you cancel a dialog, the installer writes the example
+   configuration and does not start the service. Edit `/etc/pc-agent/config.toml`. Then run
+   `sudo launchctl bootstrap system /Library/LaunchDaemons/pc-agent.plist`.
+
+To uninstall, run `sudo /usr/local/share/pc-agent/uninstall.sh`. It keeps
+`/etc/pc-agent/config.toml`. The option `--purge` also removes `/etc/pc-agent` and the log.
+
+### Other ways
+
+Use the prebuilt archive or a clone of the repo.
+
 1. Get the files. Use one of two ways.
 
    Download `pc-agent-aarch64-macos.tar.gz` and its `.sha256` file from a release. Then check

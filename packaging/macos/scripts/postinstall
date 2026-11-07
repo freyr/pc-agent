@@ -1,0 +1,242 @@
+#!/bin/bash
+# Installer postinstall: set the file modes, write the configuration when there is
+# none, start the service and report whether the agent connected.
+# Runs as root. $3 is the target volume (normally /). Always exits 0.
+#
+# The script runs main only when it is executed. A test can source it.
+
+set -u
+
+bin="/usr/local/bin/pc-agent"
+plist="/Library/LaunchDaemons/pc-agent.plist"
+share="/usr/local/share/pc-agent"
+conf_dir="/etc/pc-agent"
+conf="$conf_dir/config.toml"
+log="/var/log/pc-agent.log"
+
+# Console user state, set by find_console_user.
+console_user=""
+console_uid=""
+
+say() {
+  echo "pc-agent: $*"
+}
+
+find_console_user() {
+  console_user="$(stat -f%Su /dev/console 2>/dev/null || true)"
+  case "$console_user" in
+    "" | root | loginwindow)
+      console_user=""
+      return 1
+      ;;
+  esac
+  console_uid="$(id -u "$console_user" 2>/dev/null || true)"
+  [[ -n "$console_uid" ]]
+}
+
+# Show a dialog in the session of the console user.
+# Usage: ask <prompt> <default> <plain|hidden>   (prints the answer; fails on cancel)
+# The text goes in as arguments, never into the AppleScript source.
+ask() {
+  launchctl asuser "$console_uid" sudo -u "$console_user" osascript - "$1" "$2" "$3" <<'APPLESCRIPT'
+on run argv
+  set thePrompt to item 1 of argv
+  set theDefault to item 2 of argv
+  set theMode to item 3 of argv
+  if theMode is "hidden" then
+    set r to display dialog thePrompt default answer theDefault with title "pc-agent" with hidden answer buttons {"Cancel", "OK"} default button "OK"
+  else
+    set r to display dialog thePrompt default answer theDefault with title "pc-agent" buttons {"Cancel", "OK"} default button "OK"
+  end if
+  return text returned of r
+end run
+APPLESCRIPT
+}
+
+# Show a message in the session of the console user. Ignore errors.
+notify() {
+  [[ -n "$console_uid" ]] || return 0
+  launchctl asuser "$console_uid" sudo -u "$console_user" osascript - "$1" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  display dialog (item 1 of argv) with title "pc-agent" buttons {"OK"} default button "OK"
+end run
+APPLESCRIPT
+}
+
+# Entity ID prefix from a device name: lower case, every character outside
+# [a-z0-9] becomes _, repeated _ collapse, leading and trailing _ go.
+derive_prefix() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -e 's/[^a-z0-9]/_/g' -e 's/__*/_/g' -e 's/^_//' -e 's/_$//'
+}
+
+# True when the text holds a control character.
+has_control() {
+  [[ "$1" == *[[:cntrl:]]* ]]
+}
+
+# Escape a text for a TOML basic string. Fails on a control character.
+toml_escape() {
+  has_control "$1" && return 1
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# Write the configuration file.
+# Usage: write_config <dest> <host> <port> <user> <password> <name> <prefix>
+# The file is written with umask 077 next to the destination, then moved.
+write_config() {
+  local dest="$1" host="$2" port="$3" user="$4" pass="$5" name="$6" prefix="$7"
+  local e_host e_user e_pass e_name e_prefix tmp
+  e_host="$(toml_escape "$host")" || return 1
+  e_user="$(toml_escape "$user")" || return 1
+  e_pass="$(toml_escape "$pass")" || return 1
+  e_name="$(toml_escape "$name")" || return 1
+  e_prefix="$(toml_escape "$prefix")" || return 1
+  tmp="$(umask 077 && mktemp "$(dirname "$dest")/.config.XXXXXX")" || return 1
+  {
+    printf '[mqtt]\n'
+    printf 'host = "%s"\n' "$e_host"
+    printf 'port = %s\n' "$port"
+    printf 'username = "%s"\n' "$e_user"
+    printf 'password = "%s"\n' "$e_pass"
+    printf '\n[device]\n'
+    printf 'name = "%s"\n' "$e_name"
+    printf 'identifier = "pc-agent-%s"\n' "$e_name"
+    printf 'entity_prefix = "%s"\n' "$e_prefix"
+  } >"$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  chmod 0600 "$tmp"
+  if [[ $EUID -eq 0 ]]; then
+    chown root:wheel "$tmp"
+  fi
+  mv -f "$tmp" "$dest"
+}
+
+# Ask for the broker address, up to 3 times. Sets a_host and a_port.
+a_host="" a_port="" a_user="" a_pass="" a_name="" a_prefix=""
+ask_broker() {
+  local msg="" broker host port
+  for _ in 1 2 3; do
+    broker="$(ask "${msg}MQTT broker address (host or host:port, default port 1883):" "" plain)" || return 1
+    host="$broker"
+    port=1883
+    if [[ "$broker" == *:* ]]; then
+      host="${broker%:*}"
+      port="${broker##*:}"
+    fi
+    if [[ -z "$host" ]] || has_control "$host" || [[ "$host" == *[[:space:]]* ]]; then
+      msg="The broker address is not valid. "
+      continue
+    fi
+    if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+      msg="The port must be a number from 1 to 65535. "
+      continue
+    fi
+    a_host="$host"
+    a_port=$((10#$port))
+    return 0
+  done
+  return 1
+}
+
+# Ask for a value up to 3 times until it matches a pattern. Prints the value.
+# Usage: ask_checked <prompt> <default> <regex> <error message>
+ask_checked() {
+  local msg="" value
+  for _ in 1 2 3; do
+    value="$(ask "${msg}$1" "$2" plain)" || return 1
+    if [[ "$value" =~ $3 ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+    msg="$4 "
+  done
+  return 1
+}
+
+# Ask for all values. Sets the a_* globals on success.
+collect_answers() {
+  local default_name
+  default_name="$(scutil --get LocalHostName 2>/dev/null || true)"
+  ask_broker || return 1
+  a_user="$(ask "MQTT user name:" "" plain)" || return 1
+  has_control "$a_user" && return 1
+  a_pass="$(ask "MQTT password:" "" hidden)" || return 1
+  has_control "$a_pass" && return 1
+  a_name="$(ask_checked "Device name in Home Assistant (letters, digits, - and _):" "$default_name" '^[A-Za-z0-9_-]+$' "The device name is not valid.")" || return 1
+  a_prefix="$(ask_checked "Entity ID prefix (lower-case letters, digits and _):" "$(derive_prefix "$a_name")" '^[a-z0-9_]+$' "The prefix is not valid.")" || return 1
+}
+
+# Install the example configuration and print the next steps.
+fallback_config() {
+  mkdir -p "$conf_dir"
+  chown root:wheel "$conf_dir"
+  chmod 0755 "$conf_dir"
+  install -m 0600 -o root -g wheel "$share/config.example.toml" "$conf"
+  say "Installed the example configuration at $conf. The service is not started."
+  say "Next steps:"
+  say "  1. Edit $conf (broker address, user, password, device names)."
+  say "  2. sudo launchctl bootstrap system $plist"
+  say "  3. Read the log: tail -f $log"
+}
+
+main() {
+  chmod 0755 "$bin"
+  chown root:wheel "$bin"
+  xattr -d com.apple.quarantine "$bin" 2>/dev/null || true
+  chmod 0644 "$plist"
+  chown root:wheel "$plist"
+  chmod 0755 "$share"
+  chown -R root:wheel "$share"
+
+  if [[ -e "$conf" ]]; then
+    say "Keep the existing $conf."
+    find_console_user || true
+  else
+    if ! find_console_user || ! collect_answers; then
+      fallback_config
+      return 0
+    fi
+    mkdir -p "$conf_dir"
+    chown root:wheel "$conf_dir"
+    chmod 0755 "$conf_dir"
+    if ! write_config "$conf" "$a_host" "$a_port" "$a_user" "$a_pass" "$a_name" "$a_prefix"; then
+      rm -f "$conf"
+      fallback_config
+      return 0
+    fi
+    say "Wrote $conf."
+  fi
+
+  local size=0 appended result
+  [[ -f "$log" ]] && size="$(stat -f%z "$log")"
+  if ! launchctl bootstrap system "$plist"; then
+    say "The service did not start. Run: sudo launchctl bootstrap system $plist"
+    notify "The service did not start. Run: sudo launchctl bootstrap system $plist"
+    return 0
+  fi
+
+  result="not connected yet. See $log"
+  for _ in $(seq 1 50); do
+    if [[ -f "$log" ]]; then
+      appended="$(tail -c +"$((size + 1))" "$log" 2>/dev/null || true)"
+      if [[ "$appended" == *"connected to broker"* ]]; then
+        result="connected to the broker"
+        break
+      fi
+    fi
+    sleep 0.2
+  done
+  say "The agent is $result."
+  notify "The agent is $result."
+  return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+  exit 0
+fi
