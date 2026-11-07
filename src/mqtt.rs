@@ -176,12 +176,18 @@ where
     let mut poll_tick = interval(POLL_INTERVAL);
     poll_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // While disconnected, no state is queued: the connect publishes all states.
+    // The tick is off then too, because a cancel of `eventloop.poll()` drops a
+    // connect in progress (its timeout is longer than the tick).
     let mut connected = false;
+    // After a connection error: the time of the next connect attempt.
+    let mut retry_at: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
             _ = &mut stop => break,
-            _ = poll_tick.tick() => {
+            _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)),
+                if retry_at.is_some() => retry_at = None,
+            _ = poll_tick.tick(), if connected => {
                 let states = core.update(poll(), Instant::now());
                 if connected {
                     session.publish_states(cfg, states);
@@ -194,10 +200,12 @@ where
                     }
                 });
             }
-            event = session.eventloop.poll() => match event {
+            event = session.eventloop.poll(), if retry_at.is_none() => match event {
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!(host = %cfg.mqtt.host, port = cfg.mqtt.port, "connected to broker");
                     connected = true;
+                    // The tick was off while disconnected: take a fresh snapshot.
+                    core.update(poll(), Instant::now());
                     let states = core.connect(Instant::now());
                     for msg in connect_messages(cfg, model, core.supplied(), &states) {
                         session.publish(msg);
@@ -210,10 +218,7 @@ where
                 Err(e) => {
                     connected = false;
                     warn!(error = %e, "mqtt connection error, retry in {} s", RETRY_DELAY.as_secs());
-                    tokio::select! {
-                        _ = &mut stop => break,
-                        _ = sleep(RETRY_DELAY) => {}
-                    }
+                    retry_at = Some(tokio::time::Instant::now() + RETRY_DELAY);
                 }
             }
         }
