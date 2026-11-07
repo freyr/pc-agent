@@ -149,15 +149,21 @@ pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const EV_ABS: u16 = 0x03;
 
-const BTN_JOYSTICK: std::ops::RangeInclusive<u16> = 0x120..=0x12f;
-const BTN_SOUTH: u16 = 0x130;
+/// `BTN_JOYSTICK` (0x120) to the end of the `BTN_GAMEPAD` range; it holds
+/// `BTN_SOUTH` (0x130).
+const GAMEPAD_KEYS: std::ops::RangeInclusive<u16> = 0x120..=0x13f;
 
+const ABS_RX: u16 = 0x03;
+const ABS_RY: u16 = 0x04;
 /// `ABS_X`, `ABS_Y`, `ABS_RX`, `ABS_RY`.
-const STICK_AXES: [u16; 4] = [0x00, 0x01, 0x03, 0x04];
+const STICK_AXES: [u16; 4] = [0x00, 0x01, ABS_RX, ABS_RY];
 /// `ABS_HAT0X` to `ABS_HAT3Y`.
 const HAT_AXES: std::ops::RangeInclusive<u16> = 0x10..=0x17;
-/// `ABS_Z`, `ABS_RZ`.
-const TRIGGER_AXES: [u16; 2] = [0x02, 0x05];
+/// `ABS_Z`, `ABS_RZ`: triggers, or the right stick on a gamepad with no
+/// `ABS_RX` and no `ABS_RY`.
+const Z_AXES: [u16; 2] = [0x02, 0x05];
+/// `ABS_GAS`, `ABS_BRAKE`.
+const PEDAL_AXES: [u16; 2] = [0x09, 0x0a];
 
 /// The `absinfo` values of one absolute axis that the activity test uses.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -170,7 +176,7 @@ pub struct AxisInfo {
 /// The capabilities of one input device that the activity test uses.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputCaps {
-    /// The device has `BTN_SOUTH` or a key in the `BTN_JOYSTICK` range.
+    /// The device has a key in the `BTN_JOYSTICK` or `BTN_GAMEPAD` range.
     pub gamepad: bool,
     /// The absinfo of each absolute axis of the device, by axis code.
     pub axes: std::collections::HashMap<u16, AxisInfo>,
@@ -178,8 +184,7 @@ pub struct InputCaps {
 
 /// `true` when one of the key codes makes the device a gamepad.
 pub fn is_gamepad(keys: impl IntoIterator<Item = u16>) -> bool {
-    keys.into_iter()
-        .any(|k| k == BTN_SOUTH || BTN_JOYSTICK.contains(&k))
+    keys.into_iter().any(|k| GAMEPAD_KEYS.contains(&k))
 }
 
 /// The activity test of the spec for one event (type, code, value).
@@ -202,10 +207,14 @@ pub fn is_activity(caps: &InputCaps, kind: u16, code: u16, value: i32) -> bool {
                 i64::from(a.flat),
             );
             let range = max - min;
-            if STICK_AXES.contains(&code) || HAT_AXES.contains(&code) {
+            let z_is_stick = !caps.axes.contains_key(&ABS_RX) && !caps.axes.contains_key(&ABS_RY);
+            let stick = STICK_AXES.contains(&code)
+                || HAT_AXES.contains(&code)
+                || (z_is_stick && Z_AXES.contains(&code));
+            if stick {
                 // |v - center| > max(flat, range / 10)
                 10 * (2 * v - (min + max)).abs() > 2 * (10 * flat).max(range)
-            } else if TRIGGER_AXES.contains(&code) {
+            } else if Z_AXES.contains(&code) || PEDAL_AXES.contains(&code) {
                 // v > min + range / 10
                 10 * (v - min) > range
             } else {
@@ -494,9 +503,17 @@ mod tests {
         ])
     }
 
-    /// Sticks 0..255 flat 0 (center 127.5), triggers 0..255.
+    /// Sticks X, Y, RX, RY 0..255 flat 0 (center 127.5), triggers Z, RZ
+    /// 0..255 (the hid-playstation layout).
     fn dualsense() -> InputCaps {
-        pad(&[(ABS_X, axis(0, 255, 0)), (ABS_Z, axis(0, 255, 0))])
+        pad(&[
+            (ABS_X, axis(0, 255, 0)),
+            (0x01, axis(0, 255, 0)),
+            (ABS_RX, axis(0, 255, 0)),
+            (0x04, axis(0, 255, 0)),
+            (ABS_Z, axis(0, 255, 0)),
+            (ABS_RZ, axis(0, 255, 0)),
+        ])
     }
 
     fn keyboard() -> InputCaps {
@@ -508,6 +525,10 @@ mod tests {
         assert!(is_gamepad([KEY_A, 0x130]));
         assert!(is_gamepad([0x120]));
         assert!(is_gamepad([0x12f]));
+        // A pad with only BTN_EAST, and the end of the BTN_GAMEPAD range.
+        assert!(is_gamepad([0x131]));
+        assert!(is_gamepad([0x13f]));
+        assert!(!is_gamepad([0x140]));
         assert!(!is_gamepad([KEY_A, 0x110, 0x14a]));
         assert!(!is_gamepad([]));
     }
@@ -580,6 +601,57 @@ mod tests {
         assert!(!is_activity(&dualsense(), EV_ABS, ABS_Z, 0));
         assert!(!is_activity(&dualsense(), EV_ABS, ABS_Z, 13));
         assert!(is_activity(&dualsense(), EV_ABS, ABS_Z, 51));
+    }
+
+    const ABS_Y: u16 = 0x01;
+    const ABS_GAS: u16 = 0x09;
+    const ABS_BRAKE: u16 = 0x0a;
+
+    /// A DInput-style pad: sticks on X, Y, Z, RZ (0..255), no RX and no RY,
+    /// triggers on GAS and BRAKE (0..255).
+    fn dinput() -> InputCaps {
+        pad(&[
+            (ABS_X, axis(0, 255, 0)),
+            (ABS_Y, axis(0, 255, 0)),
+            (ABS_Z, axis(0, 255, 0)),
+            (ABS_RZ, axis(0, 255, 0)),
+            (ABS_GAS, axis(0, 255, 0)),
+            (ABS_BRAKE, axis(0, 255, 0)),
+        ])
+    }
+
+    #[test]
+    fn z_and_rz_are_a_stick_without_rx_and_ry() {
+        // Center 127.5, threshold 25.5.
+        assert!(!is_activity(&dinput(), EV_ABS, ABS_Z, 130));
+        assert!(!is_activity(&dinput(), EV_ABS, ABS_RZ, 128));
+        assert!(is_activity(&dinput(), EV_ABS, ABS_Z, 250));
+        assert!(is_activity(&dinput(), EV_ABS, ABS_RZ, 5));
+    }
+
+    #[test]
+    fn gas_and_brake_are_triggers() {
+        assert!(!is_activity(&dinput(), EV_ABS, ABS_GAS, 5));
+        assert!(is_activity(&dinput(), EV_ABS, ABS_GAS, 200));
+        assert!(!is_activity(&dinput(), EV_ABS, ABS_BRAKE, 0));
+        assert!(is_activity(&dinput(), EV_ABS, ABS_BRAKE, 200));
+    }
+
+    #[test]
+    fn z_and_rz_stay_triggers_with_rx_and_ry() {
+        // An xpad-style pad: X, Y, RX, RY sticks; Z and RZ triggers 0..1023.
+        let xpad = pad(&[
+            (ABS_X, axis(-32768, 32767, 128)),
+            (ABS_Y, axis(-32768, 32767, 128)),
+            (ABS_RX, axis(-32768, 32767, 128)),
+            (0x04, axis(-32768, 32767, 128)),
+            (ABS_Z, axis(0, 1023, 0)),
+            (ABS_RZ, axis(0, 1023, 0)),
+        ]);
+        // 400 is near the stick center (511.5) but far above the trigger minimum.
+        assert!(is_activity(&xpad, EV_ABS, ABS_Z, 400));
+        assert!(!is_activity(&xpad, EV_ABS, ABS_RZ, 51));
+        assert!(is_activity(&xpad, EV_ABS, ABS_RZ, 205));
     }
 
     #[test]
