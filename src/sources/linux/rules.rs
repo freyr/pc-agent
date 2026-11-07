@@ -144,6 +144,78 @@ impl LockTracker {
     }
 }
 
+/// The event types of `input-event-codes.h` that the activity test uses.
+pub const EV_KEY: u16 = 0x01;
+pub const EV_REL: u16 = 0x02;
+pub const EV_ABS: u16 = 0x03;
+
+const BTN_JOYSTICK: std::ops::RangeInclusive<u16> = 0x120..=0x12f;
+const BTN_SOUTH: u16 = 0x130;
+
+/// `ABS_X`, `ABS_Y`, `ABS_RX`, `ABS_RY`.
+const STICK_AXES: [u16; 4] = [0x00, 0x01, 0x03, 0x04];
+/// `ABS_HAT0X` to `ABS_HAT3Y`.
+const HAT_AXES: std::ops::RangeInclusive<u16> = 0x10..=0x17;
+/// `ABS_Z`, `ABS_RZ`.
+const TRIGGER_AXES: [u16; 2] = [0x02, 0x05];
+
+/// The `absinfo` values of one absolute axis that the activity test uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxisInfo {
+    pub min: i32,
+    pub max: i32,
+    pub flat: i32,
+}
+
+/// The capabilities of one input device that the activity test uses.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputCaps {
+    /// The device has `BTN_SOUTH` or a key in the `BTN_JOYSTICK` range.
+    pub gamepad: bool,
+    /// The absinfo of each absolute axis of the device, by axis code.
+    pub axes: std::collections::HashMap<u16, AxisInfo>,
+}
+
+/// `true` when one of the key codes makes the device a gamepad.
+pub fn is_gamepad(keys: impl IntoIterator<Item = u16>) -> bool {
+    keys.into_iter()
+        .any(|k| k == BTN_SOUTH || BTN_JOYSTICK.contains(&k))
+}
+
+/// The activity test of the spec for one event (type, code, value).
+/// It reads the values and forgets them; nothing of the event is kept.
+pub fn is_activity(caps: &InputCaps, kind: u16, code: u16, value: i32) -> bool {
+    match kind {
+        EV_KEY => value == 1,
+        EV_REL => true,
+        EV_ABS if !caps.gamepad => true,
+        EV_ABS => {
+            let Some(a) = caps.axes.get(&code) else {
+                return false;
+            };
+            // In tenths and doubled where needed, so that 10 % of the range
+            // and the center (min + max) / 2 stay integers.
+            let (v, min, max, flat) = (
+                i64::from(value),
+                i64::from(a.min),
+                i64::from(a.max),
+                i64::from(a.flat),
+            );
+            let range = max - min;
+            if STICK_AXES.contains(&code) || HAT_AXES.contains(&code) {
+                // |v - center| > max(flat, range / 10)
+                10 * (2 * v - (min + max)).abs() > 2 * (10 * flat).max(range)
+            } else if TRIGGER_AXES.contains(&code) {
+                // v > min + range / 10
+                10 * (v - min) > range
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +453,159 @@ mod tests {
         let mut t = LockTracker::new();
         t.update(true, Some(LockRead::Locked));
         assert_eq!(t.update(true, None), SessionState::Unlocked);
+    }
+
+    // The activity test. Fixtures: an Xbox-style pad and a DualSense.
+
+    const ABS_X: u16 = 0x00;
+    const ABS_RX: u16 = 0x03;
+    const ABS_Z: u16 = 0x02;
+    const ABS_RZ: u16 = 0x05;
+    const ABS_HAT0X: u16 = 0x10;
+    const ABS_HAT0Y: u16 = 0x11;
+    const ABS_MISC: u16 = 0x28;
+    const EV_SYN: u16 = 0x00;
+    const EV_MSC: u16 = 0x04;
+    const KEY_A: u16 = 30;
+    const REL_X: u16 = 0x00;
+
+    fn axis(min: i32, max: i32, flat: i32) -> AxisInfo {
+        AxisInfo { min, max, flat }
+    }
+
+    fn pad(axes: &[(u16, AxisInfo)]) -> InputCaps {
+        InputCaps {
+            gamepad: true,
+            axes: axes.iter().copied().collect(),
+        }
+    }
+
+    /// Sticks -32768..32767 flat 128 (left) and 4095 (right), triggers
+    /// 0..1023, hats -1..1, and an `ABS_MISC` axis.
+    fn xbox() -> InputCaps {
+        pad(&[
+            (ABS_X, axis(-32768, 32767, 128)),
+            (ABS_RX, axis(-32768, 32767, 4095)),
+            (ABS_Z, axis(0, 1023, 0)),
+            (ABS_RZ, axis(0, 1023, 0)),
+            (ABS_HAT0X, axis(-1, 1, 0)),
+            (ABS_HAT0Y, axis(-1, 1, 0)),
+            (ABS_MISC, axis(0, 255, 0)),
+        ])
+    }
+
+    /// Sticks 0..255 flat 0 (center 127.5), triggers 0..255.
+    fn dualsense() -> InputCaps {
+        pad(&[(ABS_X, axis(0, 255, 0)), (ABS_Z, axis(0, 255, 0))])
+    }
+
+    fn keyboard() -> InputCaps {
+        InputCaps::default()
+    }
+
+    #[test]
+    fn gamepad_keys() {
+        assert!(is_gamepad([KEY_A, 0x130]));
+        assert!(is_gamepad([0x120]));
+        assert!(is_gamepad([0x12f]));
+        assert!(!is_gamepad([KEY_A, 0x110, 0x14a]));
+        assert!(!is_gamepad([]));
+    }
+
+    #[test]
+    fn a_key_press_counts() {
+        assert!(is_activity(&keyboard(), EV_KEY, KEY_A, 1));
+    }
+
+    #[test]
+    fn a_key_release_and_autorepeat_do_not_count() {
+        assert!(!is_activity(&keyboard(), EV_KEY, KEY_A, 0));
+        assert!(!is_activity(&keyboard(), EV_KEY, KEY_A, 2));
+    }
+
+    #[test]
+    fn rel_counts() {
+        assert!(is_activity(&keyboard(), EV_REL, REL_X, -1));
+        assert!(is_activity(&keyboard(), EV_REL, REL_X, 0));
+    }
+
+    #[test]
+    fn syn_and_msc_do_not_count() {
+        assert!(!is_activity(&keyboard(), EV_SYN, 0, 0));
+        assert!(!is_activity(&keyboard(), EV_MSC, 4, 458756));
+    }
+
+    #[test]
+    fn a_stick_inside_the_dead_zone_does_not_count() {
+        // Left: flat 128 < 10 % of 65535 (6553.5), so 6553.5 decides.
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_X, 0));
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_X, 3000));
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_X, -6000));
+        // Right: flat 4095 is smaller than 6553.5 too.
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_RX, 4500));
+        // DualSense: 127.5 +- 25.5.
+        assert!(!is_activity(&dualsense(), EV_ABS, ABS_X, 128));
+        assert!(!is_activity(&dualsense(), EV_ABS, ABS_X, 150));
+    }
+
+    #[test]
+    fn a_stick_at_50_percent_counts() {
+        assert!(is_activity(&xbox(), EV_ABS, ABS_X, 16384));
+        assert!(is_activity(&xbox(), EV_ABS, ABS_RX, -16384));
+        assert!(is_activity(&dualsense(), EV_ABS, ABS_X, 255));
+        assert!(is_activity(&dualsense(), EV_ABS, ABS_X, 0));
+    }
+
+    #[test]
+    fn a_stick_exactly_at_the_threshold_does_not_count() {
+        // "Farther than": strict. 10 % of 200 = 20 decides here.
+        let caps = pad(&[(ABS_X, axis(-100, 100, 0))]);
+        assert!(!is_activity(&caps, EV_ABS, ABS_X, 20));
+        assert!(!is_activity(&caps, EV_ABS, ABS_X, -20));
+        assert!(is_activity(&caps, EV_ABS, ABS_X, 21));
+        // flat 300 > 10 % of 2000 = 200: flat decides.
+        let caps = pad(&[(ABS_X, axis(-1000, 1000, 300))]);
+        assert!(!is_activity(&caps, EV_ABS, ABS_X, 300));
+        assert!(!is_activity(&caps, EV_ABS, ABS_X, 250));
+        assert!(is_activity(&caps, EV_ABS, ABS_X, 301));
+    }
+
+    #[test]
+    fn a_trigger_counts_only_above_min_plus_10_percent() {
+        // 0..1023: 10 % = 102.3.
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_Z, 0));
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_RZ, 51));
+        assert!(is_activity(&xbox(), EV_ABS, ABS_RZ, 205));
+        // 0..255: 10 % = 25.5.
+        assert!(!is_activity(&dualsense(), EV_ABS, ABS_Z, 0));
+        assert!(!is_activity(&dualsense(), EV_ABS, ABS_Z, 13));
+        assert!(is_activity(&dualsense(), EV_ABS, ABS_Z, 51));
+    }
+
+    #[test]
+    fn a_hat_away_from_zero_counts() {
+        assert!(is_activity(&xbox(), EV_ABS, ABS_HAT0X, -1));
+        assert!(is_activity(&xbox(), EV_ABS, ABS_HAT0Y, 1));
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_HAT0X, 0));
+    }
+
+    #[test]
+    fn abs_misc_on_a_gamepad_does_not_count() {
+        assert!(!is_activity(&xbox(), EV_ABS, ABS_MISC, 200));
+    }
+
+    #[test]
+    fn a_gamepad_axis_without_absinfo_does_not_count() {
+        assert!(!is_activity(&pad(&[]), EV_ABS, ABS_X, 30000));
+    }
+
+    #[test]
+    fn abs_on_a_touchpad_counts() {
+        let touchpad = InputCaps {
+            gamepad: false,
+            axes: [(ABS_X, axis(0, 1216, 0))].into_iter().collect(),
+        };
+        assert!(is_activity(&touchpad, EV_ABS, ABS_X, 600));
+        assert!(is_activity(&touchpad, EV_ABS, ABS_X, 0));
     }
 }

@@ -3,6 +3,7 @@
 mod boot;
 mod drm;
 mod hyprland;
+mod input;
 mod logind;
 mod os;
 mod rules;
@@ -20,11 +21,12 @@ use crate::entities::{self, Entity};
 use rules::{LockTracker, Session};
 
 /// The entities that the Linux sources supply.
-static SUPPLIED: [&Entity; 5] = [
+static SUPPLIED: [&Entity; 6] = [
     &entities::LASTBOOT,
     &entities::SESSIONSTATE,
     &entities::LOGGEDUSERS,
     &entities::DISPLAY,
+    &entities::LASTACTIVE,
     &entities::LASTSYSTEMSTATECHANGE,
 ];
 
@@ -54,13 +56,16 @@ pub fn boot_time() -> Option<i64> {
 }
 
 /// One snapshot: the logind sessions, the Hyprland monitors of the active
-/// session and, without them, the DRM connectors.
+/// session and, without them, the DRM connectors, and the last input time.
 pub fn poll() -> Snapshot {
-    snapshot(
-        logind::sessions(),
-        Path::new(hyprland::RUN_USER),
-        Path::new(drm::DRM_DIR),
-    )
+    Snapshot {
+        last_input: input::last_input(),
+        ..snapshot(
+            logind::sessions(),
+            Path::new(hyprland::RUN_USER),
+            Path::new(drm::DRM_DIR),
+        )
+    }
 }
 
 /// The snapshot from the logind session list (`None` before the first read)
@@ -101,9 +106,10 @@ fn socket_warning(warned: &AtomicBool, answered: bool) -> bool {
 }
 
 /// The receiver of the sleep and wake events. No source sends them yet.
-/// Starts the logind task, so call it once, inside the tokio runtime.
+/// Starts the logind and input tasks, so call it once, inside the tokio runtime.
 pub fn events() -> mpsc::Receiver<SystemEvent> {
     logind::start();
+    input::start();
     mpsc::channel(1).1
 }
 
@@ -115,7 +121,7 @@ mod tests {
     use crate::core::{Core, SessionState};
 
     #[test]
-    fn linux_publishes_five_entities() {
+    fn linux_publishes_six_entities() {
         let names: Vec<&str> = supplied().iter().map(|e| e.name).collect();
         assert_eq!(
             names,
@@ -124,6 +130,7 @@ mod tests {
                 "sessionstate",
                 "loggedusers",
                 "display",
+                "lastactive",
                 "lastsystemstatechange"
             ]
         );
@@ -135,6 +142,7 @@ mod tests {
                 session: Some(SessionState::Locked),
                 users: Some(vec!["bob".into(), "alice".into()]),
                 display: Some(false),
+                last_input: Some(1_787_892_955),
                 ..Snapshot::default()
             },
             now,
@@ -151,6 +159,7 @@ mod tests {
                 ("sessionstate", "Locked".to_string()),
                 ("loggedusers", r#"["alice","bob"]"#.to_string()),
                 ("display", "OFF".to_string()),
+                ("lastactive", "2026-08-28 04:55:55Z".to_string()),
                 ("lastsystemstatechange", "ApplicationStarted".to_string()),
             ]
         );
