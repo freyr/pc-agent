@@ -68,7 +68,7 @@ pub fn poll() -> Snapshot {
 fn snapshot(sessions: Option<Vec<Session>>, run_user: &Path, drm_dir: &Path) -> Snapshot {
     let active = sessions.as_deref().and_then(rules::active_session);
     let monitors = active.and_then(|s| hyprland::monitors(run_user, s.uid));
-    if active.is_some() && monitors.is_none() && !WARNED_SOCKET.swap(true, Ordering::Relaxed) {
+    if active.is_some() && socket_warning(&WARNED_SOCKET, monitors.is_some()) {
         warn!("no answer from the Hyprland socket of the active session: sessionstate is Unlocked");
     }
     let display = match &monitors {
@@ -86,6 +86,17 @@ fn snapshot(sessions: Option<Vec<Session>>, run_user: &Path, drm_dir: &Path) -> 
         users: sessions.as_deref().map(rules::logged_users),
         display,
         ..Snapshot::default()
+    }
+}
+
+/// `true` when the socket of the active session did not answer and the
+/// warning of this outage is not logged yet. An answer ends the outage.
+fn socket_warning(warned: &AtomicBool, answered: bool) -> bool {
+    if answered {
+        warned.store(false, Ordering::Relaxed);
+        false
+    } else {
+        !warned.swap(true, Ordering::Relaxed)
     }
 }
 
@@ -162,5 +173,15 @@ mod tests {
                 ..Snapshot::default()
             }
         );
+    }
+
+    #[test]
+    fn each_socket_outage_warns_once() {
+        let warned = AtomicBool::new(false);
+        let calls: Vec<bool> = [false, false, true, false, false]
+            .into_iter()
+            .map(|answered| socket_warning(&warned, answered))
+            .collect();
+        assert_eq!(calls, [true, false, false, true, false]);
     }
 }

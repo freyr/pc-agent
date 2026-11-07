@@ -13,8 +13,8 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// The delay before a new connect after the bus or logind failed.
 const RETRY: Duration = Duration::from_secs(30);
 
-/// The last session list. `None` until the first read attempt is done; an
-/// empty list while the system bus or logind is not reachable.
+/// The last good session list. `None` until the first read attempt is done;
+/// an empty list when the bus or logind failed before the first good read.
 static SESSIONS: Mutex<Option<Vec<Session>>> = Mutex::new(None);
 
 #[zbus::proxy(
@@ -51,6 +51,18 @@ fn store(list: Vec<Session>) {
     *SESSIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(list);
 }
 
+fn store_failure() {
+    failed(&mut SESSIONS.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// A failed read or a bus loss: the last good list stays; without one, the
+/// list is empty (no session).
+fn failed(state: &mut Option<Vec<Session>>) {
+    if state.is_none() {
+        *state = Some(Vec::new());
+    }
+}
+
 /// Starts the logind task. Call it once, inside the tokio runtime.
 pub fn start() {
     tokio::spawn(run());
@@ -70,11 +82,11 @@ async fn run() {
                     Err(e) => {
                         if !warned {
                             warn!(
-                                "cannot read the logind sessions, no session until a retry works: {e}"
+                                "cannot read the logind sessions, the last list stays until a retry works: {e}"
                             );
                             warned = true;
                         }
-                        store(Vec::new());
+                        store_failure();
                         break;
                     }
                 }
@@ -82,10 +94,12 @@ async fn run() {
             },
             Err(e) => {
                 if !warned {
-                    warn!("system bus not reachable, no session until a retry works: {e}");
+                    warn!(
+                        "system bus not reachable, the last session list stays until a retry works: {e}"
+                    );
                     warned = true;
                 }
-                store(Vec::new());
+                store_failure();
             }
         }
         tokio::time::sleep(RETRY).await;
@@ -129,4 +143,34 @@ async fn properties(
         proxy.remote().await?,
         proxy.active().await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alice() -> Session {
+        Session {
+            uid: 1000,
+            user: "alice".into(),
+            class: "user".into(),
+            kind: "wayland".into(),
+            remote: false,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn a_failure_after_a_good_read_keeps_the_list() {
+        let mut state = Some(vec![alice()]);
+        failed(&mut state);
+        assert_eq!(state, Some(vec![alice()]));
+    }
+
+    #[test]
+    fn a_failure_without_a_good_read_gives_no_session() {
+        let mut state = None;
+        failed(&mut state);
+        assert_eq!(state, Some(Vec::new()));
+    }
 }
