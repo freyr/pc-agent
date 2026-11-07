@@ -1,27 +1,163 @@
-//! The macOS sources. A stub: task M2 adds the sources.
+//! The macOS sources.
+
+mod iokit;
+mod rules;
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
+use tracing::warn;
 
-use crate::core::{Snapshot, SystemEvent};
-use crate::entities::Entity;
+use crate::core::{SessionState, Snapshot, SystemEvent};
+use crate::entities::{self, Entity};
+
+use rules::InputTracker;
+
+/// The entities that the macOS sources supply.
+static SUPPLIED: [&Entity; 6] = [
+    &entities::SESSIONSTATE,
+    &entities::LASTACTIVE,
+    &entities::LASTBOOT,
+    &entities::LASTSYSTEMSTATECHANGE,
+    &entities::GPULOAD,
+    &entities::LOGGEDUSERS,
+];
+
+/// The source state of `lastactive`.
+static INPUT: Mutex<InputTracker> = Mutex::new(InputTracker::new());
+
+static WARNED_CONSOLE: AtomicBool = AtomicBool::new(false);
+static WARNED_IDLE: AtomicBool = AtomicBool::new(false);
+static WARNED_GPU: AtomicBool = AtomicBool::new(false);
+
+/// Logs a failed read once, not at each poll.
+fn warn_once(flag: &AtomicBool, message: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        warn!("{message}");
+    }
+}
 
 pub fn supplied() -> &'static [&'static Entity] {
-    &[]
+    &SUPPLIED
 }
 
+/// The device model: `macOS <version>`.
 pub fn model() -> String {
-    "macOS".to_string()
+    match iokit::os_version() {
+        Some(version) => format!("macOS {version}"),
+        None => "macOS".to_string(),
+    }
 }
 
+/// The boot time in seconds since the epoch.
 pub fn boot_time() -> Option<i64> {
-    None
+    let boot = iokit::boot_time();
+    if boot.is_none() {
+        warn!("no lastboot state: cannot read kern.boottime");
+    }
+    boot
 }
 
+/// One snapshot: the console list, the HID idle time and the GPU statistics.
 pub fn poll() -> Snapshot {
-    Snapshot::default()
+    let (session, users) = match iokit::console_sessions() {
+        Some(list) => (
+            Some(rules::session_state(&list)),
+            Some(rules::logged_users(&list)),
+        ),
+        None => {
+            warn_once(&WARNED_CONSOLE, "cannot read IOConsoleUsers");
+            (Some(SessionState::NotKnown), None)
+        }
+    };
+
+    let last_input = match iokit::hid_idle_ns() {
+        Some(idle_ns) => {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            let mut input = INPUT.lock().unwrap_or_else(|e| e.into_inner());
+            Some(input.update(now_ms, idle_ns))
+        }
+        None => {
+            warn_once(&WARNED_IDLE, "cannot read HIDIdleTime of IOHIDSystem");
+            None
+        }
+    };
+
+    let gpu = iokit::gpu_stats().and_then(|stats| rules::gpu_sample(&stats));
+    if gpu.is_none() {
+        warn_once(&WARNED_GPU, "no GPU utilization from IOAccelerator");
+    }
+
+    Snapshot {
+        session,
+        users,
+        last_input,
+        display: None,
+        gpu,
+    }
 }
 
 /// The receiver of the sleep and wake events. No source sends them yet.
 pub fn events() -> mpsc::Receiver<SystemEvent> {
     mpsc::channel(1).1
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::core::{Core, GpuSample};
+
+    #[test]
+    fn macos_publishes_six_entities() {
+        let names: Vec<&str> = supplied().iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            [
+                "sessionstate",
+                "lastactive",
+                "lastboot",
+                "lastsystemstatechange",
+                "gpuload",
+                "loggedusers"
+            ]
+        );
+
+        let now = Instant::now();
+        let mut core = Core::new(supplied(), Some(1_787_892_895));
+        core.update(
+            Snapshot {
+                session: Some(SessionState::Unlocked),
+                users: Some(vec!["alice".into()]),
+                last_input: Some(1_787_892_955),
+                display: None,
+                gpu: Some(GpuSample {
+                    load: 27,
+                    power: None,
+                }),
+            },
+            now,
+        );
+        let states: Vec<(&str, String)> = core
+            .connect(now)
+            .into_iter()
+            .map(|(e, v)| (e.name, v))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("sessionstate", "Unlocked".to_string()),
+                ("lastactive", "2026-08-28 04:55:55Z".to_string()),
+                ("lastboot", "2026-08-28 04:54:55Z".to_string()),
+                ("lastsystemstatechange", "ApplicationStarted".to_string()),
+                ("gpuload", "27".to_string()),
+                ("loggedusers", r#"["alice"]"#.to_string()),
+            ]
+        );
+    }
 }
