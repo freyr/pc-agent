@@ -52,7 +52,7 @@ pub fn options(cfg: &Config) -> MqttOptions {
 /// The messages of each (re)connect: the discovery configs of the supplied
 /// entities, an empty (retained) config for each entity of the table that is
 /// not supplied, so HA removes a stale entity, then `online`, then the given
-/// states.
+/// states. Outside Windows, a Windows-only entity gets no empty config.
 pub fn connect_messages(
     cfg: &Config,
     model: &str,
@@ -71,6 +71,7 @@ pub fn connect_messages(
         entities::ENTITIES
             .iter()
             .filter(|e| !supplied.iter().any(|s| s.name == e.name))
+            .filter(|e| cfg!(windows) || !e.windows_only)
             .map(|e| Message {
                 topic: entities::config_topic(device, e),
                 payload: String::new(),
@@ -505,29 +506,34 @@ enabled = false
             ],
         );
         let topics: Vec<&str> = msgs.iter().map(|m| m.topic.as_str()).collect();
-        assert_eq!(
-            topics,
-            [
-                "homeassistant/sensor/JAHURTX-TEST/lastboot/config",
-                "homeassistant/sensor/JAHURTX-TEST/sessionstate/config",
-                // The entities of the table that are not supplied, in table order.
-                "homeassistant/sensor/JAHURTX-TEST/lastactive/config",
-                "homeassistant/sensor/JAHURTX-TEST/lastsystemstatechange/config",
-                "homeassistant/sensor/JAHURTX-TEST/gpuload/config",
-                "homeassistant/sensor/JAHURTX-TEST/gpupower/config",
-                "homeassistant/sensor/JAHURTX-TEST/loggedusers/config",
-                "homeassistant/binary_sensor/JAHURTX-TEST/display/config",
-                "homeassistant/sensor/JAHURTX-TEST/availability",
-                "homeassistant/sensor/JAHURTX-TEST/lastboot/state",
-                "homeassistant/sensor/JAHURTX-TEST/sessionstate/state",
-            ]
-        );
-        for m in &msgs[2..8] {
+        let mut expected = vec![
+            "homeassistant/sensor/JAHURTX-TEST/lastboot/config",
+            "homeassistant/sensor/JAHURTX-TEST/sessionstate/config",
+            // The entities of the table that are not supplied, in table order.
+            "homeassistant/sensor/JAHURTX-TEST/lastactive/config",
+            "homeassistant/sensor/JAHURTX-TEST/lastsystemstatechange/config",
+            "homeassistant/sensor/JAHURTX-TEST/gpuload/config",
+            "homeassistant/sensor/JAHURTX-TEST/gpupower/config",
+            "homeassistant/sensor/JAHURTX-TEST/loggedusers/config",
+            "homeassistant/binary_sensor/JAHURTX-TEST/display/config",
+        ];
+        // Only the Windows agent clears the Windows-only entity.
+        if cfg!(windows) {
+            expected.push("homeassistant/binary_sensor/JAHURTX-TEST/inputhelper/config");
+        }
+        let empty = expected.len();
+        expected.extend([
+            "homeassistant/sensor/JAHURTX-TEST/availability",
+            "homeassistant/sensor/JAHURTX-TEST/lastboot/state",
+            "homeassistant/sensor/JAHURTX-TEST/sessionstate/state",
+        ]);
+        assert_eq!(topics, expected);
+        for m in &msgs[2..empty] {
             assert_eq!(m.payload, "", "{}", m.topic);
         }
-        assert_eq!(msgs[8].payload, "online");
-        assert_eq!(msgs[9].payload, "2026-08-28 04:54:55Z");
-        assert_eq!(msgs[10].payload, "Unknown");
+        assert_eq!(msgs[empty].payload, "online");
+        assert_eq!(msgs[empty + 1].payload, "2026-08-28 04:54:55Z");
+        assert_eq!(msgs[empty + 2].payload, "Unknown");
         let config: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
         assert_eq!(config["name"], "lastboot");
         assert_eq!(config["device"]["model"], "3.1.0");
@@ -547,7 +553,11 @@ enabled = false
         let cfg = Config::parse(CFG).unwrap();
         let msgs = connect_messages(&cfg, "3.1.0", &[], &[]);
         let empty: Vec<&Message> = msgs.iter().filter(|m| m.payload.is_empty()).collect();
-        assert_eq!(empty.len(), entities::ENTITIES.len());
+        let clearable = entities::ENTITIES
+            .iter()
+            .filter(|e| cfg!(windows) || !e.windows_only)
+            .count();
+        assert_eq!(empty.len(), clearable);
         for m in empty {
             let t = &m.topic;
             assert!(
@@ -557,6 +567,23 @@ enabled = false
                 "{t}"
             );
             assert!(!t.contains("hass.agent") && !t.contains("button"), "{t}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_non_windows_agent_publishes_no_empty_config_for_inputhelper() {
+        // The source of this OS (Linux in the CI job `linux`), with and without the GPU.
+        let cfg = Config::parse(CFG).unwrap();
+        for gpu in [true, false] {
+            let supplied = crate::sources::supplied(gpu);
+            assert!(!supplied.iter().any(|e| e.windows_only));
+            let msgs = connect_messages(&cfg, "3.1.0", supplied, &[]);
+            assert!(
+                !msgs.iter().any(|m| m.topic.contains("/inputhelper/")),
+                "{:?}",
+                msgs.iter().map(|m| &m.topic).collect::<Vec<_>>()
+            );
         }
     }
 

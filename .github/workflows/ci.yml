@@ -56,3 +56,118 @@ jobs:
             dist/pc-agent-*-macos.pkg
             dist/pc-agent-*-macos.pkg.sha256
           if-no-files-found: error
+
+  # The runner has no interactive session and no NVIDIA GPU. The job installs
+  # the service, runs it against a local broker and removes it.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pc-agent-x86_64-windows
+          path: target/release/pc-agent.exe
+          if-no-files-found: error
+
+      - name: Start a Mosquitto broker on 127.0.0.1:1883
+        run: |
+          choco install mosquitto -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install mosquitto failed" }
+          # The package can register a mosquitto service; the job runs its own broker.
+          Stop-Service mosquitto -ErrorAction SilentlyContinue
+          $dir = "C:\Program Files\mosquitto"
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $conf = Join-Path $env:RUNNER_TEMP "mosquitto.conf"
+          "listener 1883 127.0.0.1`nallow_anonymous true`n" | Set-Content -Path $conf -Encoding ascii
+          Start-Process -FilePath "$dir\mosquitto.exe" -ArgumentList "-c", "`"$conf`"", "-v" `
+            -RedirectStandardError (Join-Path $env:RUNNER_TEMP "mosquitto.log")
+          Start-Sleep -Seconds 3
+          if (-not (Test-NetConnection 127.0.0.1 -Port 1883 -InformationLevel Quiet)) {
+            throw "no broker on 127.0.0.1:1883"
+          }
+
+      - name: Install the service with a test configuration
+        run: |
+          $cfg = Join-Path $env:RUNNER_TEMP "ci-config.toml"
+          @"
+          [mqtt]
+          host = "127.0.0.1"
+          port = 1883
+          username = "u"
+          password = "p"
+
+          [device]
+          name = "CI-TEST"
+          identifier = "pc-agent-CI-TEST"
+          entity_prefix = "ci_test"
+
+          [gpu]
+          enabled = false
+          "@ | Set-Content -Path $cfg -Encoding utf8
+          .\target\release\pc-agent.exe install --config $cfg
+          if ($LASTEXITCODE -ne 0) { throw "pc-agent install failed" }
+          sc.exe qc pc-agent
+          sc.exe qfailure pc-agent
+
+      - name: Check that only SYSTEM and Administrators can open C:\ProgramData\pc-agent
+        run: |
+          $out = icacls C:\ProgramData\pc-agent
+          $out
+          $aces = @($out | Where-Object { $_ -match ':\(' })
+          if ($aces.Count -ne 2) { throw "expected 2 entries, got $($aces.Count)" }
+          foreach ($ace in $aces) {
+            if ($ace -notmatch 'NT AUTHORITY\\SYSTEM:|BUILTIN\\Administrators:') { throw "unexpected entry: $ace" }
+          }
+
+      - name: Start the service and read the retained states
+        run: |
+          sc.exe start pc-agent
+          Start-Sleep -Seconds 5
+          $query = sc.exe query pc-agent
+          $query
+          if (-not ($query -match 'RUNNING')) { throw "pc-agent is not RUNNING" }
+          $online = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/availability' -C 1 -W 20
+          "availability: $online"
+          if ($online -ne 'online') { throw "expected online, got '$online'" }
+          $boot = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/lastboot/state' -C 1 -W 20
+          "lastboot: $boot"
+          if ($boot -notmatch '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z$') { throw "bad lastboot '$boot'" }
+          $config = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/lastboot/config' -C 1 -W 20
+          "lastboot config: $config"
+          if (($config | ConvertFrom-Json).name -ne 'lastboot') { throw "bad lastboot config" }
+
+      - name: Uninstall the service
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          .\target\release\pc-agent.exe uninstall
+          if ($LASTEXITCODE -ne 0) { throw "pc-agent uninstall failed" }
+          $offline = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/availability' -C 1 -W 20
+          "availability: $offline"
+          if ($offline -ne 'offline') { throw "expected offline after the stop, got '$offline'" }
+          # 1060: the service does not exist.
+          $gone = $false
+          foreach ($i in 1..10) {
+            sc.exe query pc-agent | Out-Null
+            if ($LASTEXITCODE -eq 1060) { $gone = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $gone) { throw "the service pc-agent still exists" }
+          if (-not (Test-Path C:\ProgramData\pc-agent\config.toml)) { throw "uninstall removed the configuration" }
+          $global:LASTEXITCODE = 0
+
+      - name: Show the logs
+        if: always()
+        run: |
+          Get-Content C:\ProgramData\pc-agent\pc-agent.log -ErrorAction SilentlyContinue
+          Get-Content (Join-Path $env:RUNNER_TEMP "mosquitto.log") -ErrorAction SilentlyContinue
+          $global:LASTEXITCODE = 0

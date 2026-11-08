@@ -5,7 +5,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+#[cfg(not(windows))]
 pub const DEFAULT_PATH: &str = "/etc/pc-agent/config.toml";
+#[cfg(windows)]
+pub const DEFAULT_PATH: &str = r"C:\ProgramData\pc-agent\config.toml";
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
