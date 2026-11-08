@@ -21,6 +21,11 @@ pub fn console_state() -> Option<SessionState> {
 
 /// The user names of the logged-in sessions; `None` when the list failed.
 pub fn logged_users() -> Option<Vec<String>> {
+    sessions().map(|list| wts_rules::logged_users(&list))
+}
+
+/// `WTSSessionInfoEx` of each session; `None` when the list failed.
+pub fn sessions() -> Option<Vec<WtsSession>> {
     let mut list: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
     let mut count = 0u32;
     // SAFETY: valid out pointers; the list is freed with WTSFreeMemory below.
@@ -40,8 +45,7 @@ pub fn logged_users() -> Option<Vec<String>> {
     // A failed read of one session fails the whole list: dropping that user
     // would give a false SessionLogoff and then a false SessionLogon. The
     // last list stays until the next poll.
-    let sessions: Vec<WtsSession> = ids.into_iter().map(session).collect::<Option<_>>()?;
-    Some(wts_rules::logged_users(&sessions))
+    ids.into_iter().map(session).collect()
 }
 
 /// `WTSSessionInfoEx` of one session; `None` when the read failed.

@@ -113,6 +113,7 @@ pub fn poll(gpu: bool) -> Snapshot {
         last_input,
         display: None,
         gpu,
+        helper: None,
     }
 }
 
@@ -163,6 +164,7 @@ mod tests {
                     load: 27,
                     power: None,
                 }),
+                helper: None,
             },
             now,
         );

@@ -17,12 +17,13 @@ pub const REPUBLISH: Duration = Duration::from_secs(30);
 const IDLE_GAP_SECS: i64 = 60;
 
 /// The entities that the core publishes again every 30 s.
-const PERIODIC: [&str; 5] = [
+const PERIODIC: [&str; 6] = [
     entities::SESSIONSTATE.name,
     entities::LOGGEDUSERS.name,
     entities::DISPLAY.name,
     entities::GPULOAD.name,
     entities::GPUPOWER.name,
+    entities::INPUTHELPER.name,
 ];
 
 /// One state to publish: the entity and its payload.
@@ -67,6 +68,9 @@ pub struct Snapshot {
     /// The GPU sample of this poll. `None` (no sample) is not published, so
     /// the GPU entities expire.
     pub gpu: Option<GpuSample>,
+    /// `true` while the session helper of the console session is connected
+    /// (Windows only).
+    pub helper: Option<bool>,
 }
 
 /// The sleep, wake and shutdown events that a source sends to the core.
@@ -104,6 +108,7 @@ pub struct Core {
     last_input: Option<i64>,
     display: Option<bool>,
     gpu: Option<GpuSample>,
+    helper: Option<bool>,
     last_event: Option<&'static str>,
     /// The last published `lastactive` input time and when it was published.
     lastactive_sent: Option<(i64, Instant)>,
@@ -123,6 +128,7 @@ impl Core {
             last_input: None,
             display: None,
             gpu: None,
+            helper: None,
             last_event: Some("ApplicationStarted"),
             lastactive_sent: None,
             last_republish: None,
@@ -193,6 +199,13 @@ impl Core {
         }
 
         self.gpu = snap.gpu;
+
+        if let Some(on) = snap.helper {
+            if self.helper != Some(on) {
+                changed.push(entities::INPUTHELPER.name);
+            }
+            self.helper = Some(on);
+        }
 
         let mut idle_gap = false;
         if let Some(t) = snap.last_input {
@@ -275,6 +288,9 @@ impl Core {
         } else if name == entities::DISPLAY.name {
             self.display
                 .map(|on| if on { "ON" } else { "OFF" }.to_string())
+        } else if name == entities::INPUTHELPER.name {
+            self.helper
+                .map(|on| if on { "ON" } else { "OFF" }.to_string())
         } else {
             None
         }
@@ -286,7 +302,7 @@ mod tests {
     use super::*;
 
     /// The fake source of the tests: it supplies every entity of the table.
-    static ALL: [&Entity; 8] = [
+    static ALL: [&Entity; 9] = [
         &entities::SESSIONSTATE,
         &entities::LASTACTIVE,
         &entities::LASTBOOT,
@@ -295,6 +311,7 @@ mod tests {
         &entities::GPUPOWER,
         &entities::LOGGEDUSERS,
         &entities::DISPLAY,
+        &entities::INPUTHELPER,
     ];
 
     /// 2026-08-28 04:54:55Z, computed outside this code.
@@ -338,6 +355,7 @@ mod tests {
                     load: 37,
                     power: Some(85.26),
                 }),
+                helper: Some(true),
             },
             t0,
         );
@@ -352,7 +370,33 @@ mod tests {
                 ("gpupower", "85.3"),
                 ("loggedusers", r#"["jahu","zoe"]"#),
                 ("display", "ON"),
+                ("inputhelper", "ON"),
             ]
+        );
+    }
+
+    #[test]
+    fn inputhelper_is_published_on_change_and_every_30_s() {
+        let t0 = Instant::now();
+        let helper = |on| Snapshot {
+            helper: Some(on),
+            ..Snapshot::default()
+        };
+        let mut core = connected(&ALL, helper(false), t0);
+        assert!(names(&core.connect(t0)).contains(&("inputhelper", "OFF")));
+        assert!(core.update(helper(false), t0 + secs(2)).is_empty());
+        assert_eq!(
+            names(&core.update(helper(true), t0 + secs(4))),
+            [("inputhelper", "ON")]
+        );
+        assert!(core.update(helper(true), t0 + secs(6)).is_empty());
+        assert!(names(&core.update(helper(true), t0 + secs(30))).contains(&("inputhelper", "ON")));
+        // No value (an OS without a helper): not published.
+        let mut core = connected(&ALL, Snapshot::default(), t0);
+        assert!(
+            !names(&core.connect(t0))
+                .iter()
+                .any(|(n, _)| *n == "inputhelper")
         );
     }
 
