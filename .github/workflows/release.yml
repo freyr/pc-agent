@@ -51,6 +51,7 @@ jobs:
         with:
           name: pc-agent-x86_64-linux
           path: |
+            dist/pc-agent-x86_64-linux
             dist/pc-agent-x86_64-linux.tar.gz
             dist/pc-agent-x86_64-linux.tar.gz.sha256
           if-no-files-found: error
@@ -68,6 +69,7 @@ jobs:
         with:
           name: pc-agent-aarch64-macos
           path: |
+            dist/pc-agent-aarch64-macos
             dist/pc-agent-aarch64-macos.tar.gz
             dist/pc-agent-aarch64-macos.tar.gz.sha256
           if-no-files-found: error
@@ -80,7 +82,7 @@ jobs:
             dist/pc-agent-*-macos.pkg.sha256
           if-no-files-found: error
 
-  # W8 replaces the bare exe with pc-agent-x86_64-windows.zip.
+  # W8 adds pc-agent-x86_64-windows.zip; the bare exe stays for the self-update.
   windows:
     needs: check
     runs-on: windows-latest
@@ -117,14 +119,38 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # scripts/manifest.sh reads the version, the commit and the commit time
+      # (the build time that build.rs embeds) from the checkout.
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      # The manifest goes to signed/, not dist/, so the release steps upload
+      # it after all other assets: a client never sees a manifest whose
+      # assets are missing.
+      - name: Write and sign the manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [[ -z "$MINISIGN_SECRET_KEY" ]]; then
+            echo "::error::The repo secret MINISIGN_SECRET_KEY is not set."
+            exit 1
+          fi
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+          mkdir signed
+          bash scripts/manifest.sh dist > signed/manifest.json
+          cat signed/manifest.json
+          key="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          minisign -S -s "$key" -m signed/manifest.json -x signed/manifest.json.minisig
+          rm -f "$key"
       - name: Create the semver release
         if: github.ref_type == 'tag'
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --latest
+          gh release upload "$GITHUB_REF_NAME" signed/manifest.json signed/manifest.json.minisig
       - name: Replace the edge pre-release
         if: github.ref_type == 'branch'
         run: |
@@ -134,3 +160,4 @@ jobs:
             --prerelease --latest=false \
             --title "edge (main ${GITHUB_SHA::7})" \
             --notes "Bleeding-edge build of main at $GITHUB_SHA. Not a stable release: use the latest vX.Y.Z release for normal installs."
+          gh release upload edge signed/manifest.json signed/manifest.json.minisig

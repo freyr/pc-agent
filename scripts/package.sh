@@ -5,7 +5,9 @@
 # Run `cargo build --release` first. The target name comes from the OS:
 #   Linux x86_64  -> x86_64-linux
 #   macOS arm64   -> aarch64-macos
-# Writes two files to <output-dir>:
+# Writes three files to <output-dir>:
+#   pc-agent-<target>                (the bare binary, for the self-update; see
+#                                     scripts/manifest.sh)
 #   pc-agent-<target>.tar.gz         (pc-agent, README.md and packaging/config.example.toml;
 #                                     on macOS also packaging/pc-agent.plist and
 #                                     scripts/install-macos.sh; on Linux also
@@ -58,6 +60,7 @@ else
 fi
 
 tar -C "$stage" -czf "$out/$name" "${files[@]}"
+install -m 0755 "$root/target/release/pc-agent" "$out/pc-agent-$target"
 if [[ "$os" == "Darwin" ]]; then
   (cd "$out" && shasum -a 256 "$name" > "$name.sha256")
 else

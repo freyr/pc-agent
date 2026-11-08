@@ -99,11 +99,13 @@ give its sensor IDs in a `[unique_ids]` section (`sessionstate`, `lastactive`, `
 | Path | Content |
 |---|---|
 | `src/core.rs`, `src/mqtt.rs`, `src/entities.rs`, `src/config.rs` | OS-neutral core: the state machine, the MQTT client, the discovery payloads, the configuration. |
+| `src/update/`, `build.rs` | The signed release manifest of the self-update (no OS code); `build.rs` embeds the commit and the build time (the commit time of HEAD). |
 | `src/sources/linux/` | Linux sources: logind, Hyprland, DRM, evdev, NVML, the sleep lock, `diagnose`. |
 | `src/sources/macos/` | macOS sources: IOKit and the power notifications. |
 | `packaging/` | The systemd unit, the LaunchDaemon plist, the example configuration, the macOS package scripts. |
 | `scripts/install.sh`, `scripts/install-macos.sh` | Install scripts. |
 | `scripts/package.sh`, `scripts/build-pkg.sh` | Release archives and the macOS package (used by CI). |
+| `scripts/manifest.sh`, `scripts/check-manifest.sh` | The release manifest of the bare binaries (signed in `release.yml`) and its CI check. |
 | `scripts/probe.sh`, `scripts/probe-macos.sh` | Signal probes from development. `pc-agent diagnose` replaces them. |
 
 ## Development
