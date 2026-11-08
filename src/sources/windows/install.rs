@@ -100,20 +100,27 @@ fn try_install(config: Option<&Path>) -> Result<()> {
         account_password: None,
     };
     let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
+        // A Restart failure action needs SERVICE_START on the handle.
+        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
         .with_context(|| format!("cannot create the service {SERVICE_NAME}"))?;
-    service.set_description(DESCRIPTION)?;
+    service
+        .set_description(DESCRIPTION)
+        .context("cannot set the service description")?;
     let restart = ServiceAction {
         action_type: ServiceActionType::Restart,
         delay: Duration::from_secs(5),
     };
-    service.update_failure_actions(ServiceFailureActions {
-        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
-        reboot_msg: None,
-        command: None,
-        actions: Some(vec![restart.clone(), restart.clone(), restart]),
-    })?;
-    service.set_preshutdown_timeout(Duration::from_secs(10))?;
+    service
+        .update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart.clone(), restart.clone(), restart]),
+        })
+        .context("cannot set the failure actions")?;
+    service
+        .set_preshutdown_timeout(Duration::from_secs(10))
+        .context("cannot set the preshutdown timeout")?;
     println!("created the service {SERVICE_NAME} (LocalSystem, automatic start)");
     Ok(())
 }
