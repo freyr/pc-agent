@@ -315,10 +315,13 @@ jobs:
           "availability: $availability"
           if ($availability -ne 'offline') { throw "diagnose changed the availability to '$availability'" }
           $log = Join-Path $env:RUNNER_TEMP "mosquitto.log"
-          $lines = @(Select-String -Path $log -SimpleMatch 'pc-agent-diagnose-CI-TEST')
-          $lines | ForEach-Object { $_.Line }
+          # The mosquitto service keeps its log open: read it with shared access.
+          $stream = [System.IO.File]::Open($log, 'Open', 'Read', 'ReadWrite')
+          try { $text = (New-Object System.IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Dispose() }
+          $lines = @($text -split "`r?`n" | Where-Object { $_.Contains('pc-agent-diagnose-CI-TEST') })
+          $lines
           if ($lines.Count -eq 0) { throw "the broker log has no connect of pc-agent-diagnose-CI-TEST" }
-          if ($lines | Where-Object { $_.Line -match 'PUBLISH from pc-agent-diagnose' }) { throw "diagnose published a message" }
+          if ($lines | Where-Object { $_ -match 'PUBLISH from pc-agent-diagnose' }) { throw "diagnose published a message" }
           $global:LASTEXITCODE = 0
 
       - name: Show the logs
