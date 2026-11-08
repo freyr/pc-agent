@@ -40,7 +40,8 @@ jobs:
             echo "::error::release.yml enables an update test feature" >&2
             exit 1
           fi
-          if grep -nE 'run: cargo build --release.*--features' .github/workflows/*.yml; then
+          # Anchored to a run line, so this check does not match itself.
+          if grep -nE '^\s*(- )?run: cargo build --release.*--features' .github/workflows/*.yml; then
             echo "::error::a release build of a workflow enables a feature" >&2
             exit 1
           fi
@@ -508,7 +509,9 @@ jobs:
             'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip'
           if ($LASTEXITCODE -ne 0) { throw "the minisign download failed" }
           Expand-Archive -Path $zip -DestinationPath "$e2e\minisign" -Force
-          $minisign = (Get-ChildItem "$e2e\minisign" -Recurse -Filter minisign.exe | Select-Object -First 1).FullName
+          # The zip has a build for each CPU: take the x86_64 one.
+          $minisign = (Get-ChildItem "$e2e\minisign" -Recurse -Filter minisign.exe |
+            Where-Object { $_.FullName -match '\\x86_64\\' } | Select-Object -First 1).FullName
           if (-not $minisign) { throw "no minisign.exe in the zip" }
           & $minisign -G -W -p "$e2e\test.pub" -s "$e2e\test.key"
           if ($LASTEXITCODE -ne 0) { throw "minisign -G failed" }
