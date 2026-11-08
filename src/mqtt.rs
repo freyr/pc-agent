@@ -48,6 +48,21 @@ pub fn options(cfg: &Config) -> MqttOptions {
     opts
 }
 
+/// The options of the MQTT check of `pc-agent diagnose`.
+#[cfg(any(windows, test))]
+pub fn diagnose_options(cfg: &Config) -> MqttOptions {
+    // Its own client ID, so the broker does not end the session of the
+    // agent, and no last will, so no `offline` is left behind.
+    let mut opts = MqttOptions::new(
+        format!("pc-agent-diagnose-{}", cfg.device.name),
+        cfg.mqtt.host.clone(),
+        cfg.mqtt.port,
+    );
+    opts.set_keep_alive(KEEP_ALIVE);
+    opts.set_credentials(cfg.mqtt.username.clone(), cfg.mqtt.password.clone());
+    opts
+}
+
 /// The messages of each (re)connect: the discovery configs of the supplied
 /// entities, an empty (retained) config for each entity of the table that is
 /// not supplied, so HA removes a stale entity, then `online`, then the given
@@ -511,6 +526,18 @@ enabled = false
         assert_eq!(&will.message[..], b"offline");
         assert_eq!(will.qos, QoS::AtLeastOnce);
         assert!(will.retain);
+    }
+
+    #[test]
+    fn the_diagnose_options_have_their_own_client_id_and_no_last_will() {
+        let cfg = Config::parse(CFG).unwrap();
+        let opts = diagnose_options(&cfg);
+        assert_eq!(opts.client_id(), "pc-agent-diagnose-JAHURTX-TEST");
+        assert_ne!(opts.client_id(), options(&cfg).client_id());
+        assert_eq!(opts.broker_address(), ("broker.example".to_string(), 1884));
+        assert!(opts.last_will().is_none());
+        assert!(opts.clean_session());
+        assert_eq!(opts.credentials(), options(&cfg).credentials());
     }
 
     #[test]

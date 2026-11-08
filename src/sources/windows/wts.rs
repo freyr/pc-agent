@@ -45,7 +45,7 @@ pub fn logged_users() -> Option<Vec<String>> {
 }
 
 /// `WTSSessionInfoEx` of one session; `None` when the read failed.
-fn session(id: u32) -> Option<WtsSession> {
+pub(super) fn session(id: u32) -> Option<WtsSession> {
     let mut buf = PWSTR::null();
     let mut bytes = 0u32;
     // SAFETY: valid out pointers; the buffer is freed with WTSFreeMemory below.

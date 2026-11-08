@@ -141,7 +141,7 @@ fn try_install(config: Option<&Path>) -> Result<()> {
 
 /// A DWORD value under HKEY_LOCAL_MACHINE, or `None` when the value is
 /// missing or cannot be read.
-fn reg_dword(key: PCWSTR, name: PCWSTR) -> Option<u32> {
+pub(super) fn reg_dword(key: PCWSTR, name: PCWSTR) -> Option<u32> {
     let mut value: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
     // SAFETY: `key` and `name` are static wide strings; `value` and `size`
