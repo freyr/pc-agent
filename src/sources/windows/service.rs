@@ -5,7 +5,8 @@
 //! sleep when the handler returns. `Stop` stops the agent: it publishes the
 //! retained `offline` and disconnects. `Preshutdown` first sends `Shutdown`
 //! and waits for the reply. The handler records each console display
-//! notification for the poll.
+//! notification and each user presence notification for the poll. The
+//! service starts the session helpers and their pipe.
 
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
@@ -16,19 +17,21 @@ use std::time::Duration;
 
 use ::windows::Win32::Foundation::{ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, HANDLE};
 use ::windows::Win32::System::Power::RegisterPowerSettingNotification;
-use ::windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+use ::windows::Win32::System::SystemServices::{
+    GUID_CONSOLE_DISPLAY_STATE, GUID_GLOBAL_USER_PRESENCE,
+};
 use ::windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_SERVICE_HANDLE;
 use anyhow::Result;
 use tokio::sync::mpsc::{self, UnboundedReceiver, unbounded_channel};
 use tracing::{error, info, warn};
 use windows_service::service::{
     PowerBroadcastSetting, PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode,
-    ServiceState, ServiceStatus, ServiceType,
+    ServiceState, ServiceStatus, ServiceType, UserStatus,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use super::{DATA_DIR, DISPLAY, EVENTS, SERVICE_NAME};
+use super::{DATA_DIR, DISPLAY, EVENTS, SERVICE_NAME, record_presence, start_helpers};
 use crate::core::SystemEvent;
 use crate::logfile::LogFile;
 use crate::sources::ACK_WAIT;
@@ -153,11 +156,14 @@ fn run_service() -> Result<()> {
         .build()?;
     let handler_events = events_tx.clone();
     let handler = move |control: ServiceControl| {
-        if let ServiceControl::PowerEvent(PowerEventParam::PowerSettingChange(
-            PowerBroadcastSetting::ConsoleDisplayState(state),
-        )) = &control
-        {
-            DISPLAY.record(state.to_raw());
+        match &control {
+            ServiceControl::PowerEvent(PowerEventParam::PowerSettingChange(
+                PowerBroadcastSetting::ConsoleDisplayState(state),
+            )) => DISPLAY.record(state.to_raw()),
+            ServiceControl::PowerEvent(PowerEventParam::PowerSettingChange(
+                PowerBroadcastSetting::GlobalUserPresence(status),
+            )) => record_presence(*status == UserStatus::Present),
+            _ => {}
         }
         let (raw, event_type) = raw_codes(&control);
         match wts_rules::control_action(raw, event_type) {
@@ -201,12 +207,26 @@ fn run_service() -> Result<()> {
     } {
         warn!("no display state: RegisterPowerSettingNotification failed: {e}");
     }
+    // The fallback of lastactive while no helper of the console session is
+    // connected.
+    // SAFETY: as above.
+    if let Err(e) = unsafe {
+        RegisterPowerSettingNotification(
+            HANDLE(handle.as_raw_handle()),
+            &GUID_GLOBAL_USER_PRESENCE,
+            DEVICE_NOTIFY_SERVICE_HANDLE,
+        )
+    } {
+        warn!("no user presence: RegisterPowerSettingNotification failed: {e}");
+    }
 
     let config = CONFIG
         .get()
         .cloned()
         .unwrap_or_else(|| PathBuf::from(crate::config::DEFAULT_PATH));
     let result = crate::run(config, || {
+        // Inside the runtime: the pipe server runs on it.
+        start_helpers();
         Ok(async move {
             let preshutdown = stop_control(rx).await;
             // windows-service frees the handler closure after Stop and

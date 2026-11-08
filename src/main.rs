@@ -81,6 +81,12 @@ enum Command {
     /// session, for `diagnose`.
     #[cfg(windows)]
     SessionHelperProbe,
+    /// `session-helper [--pipe <name>]` (not in the help): the helper that
+    /// the service starts in a user session. `--pipe` is for the CI test.
+    #[cfg(windows)]
+    SessionHelper {
+        pipe: Option<String>,
+    },
     Help,
 }
 
@@ -109,13 +115,20 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
             }
             #[cfg(windows)]
             "session-helper" => {
-                if args.next().as_deref() != Some("--probe") {
-                    bail!("session-helper needs --probe");
-                }
+                let command = match (args.next().as_deref(), args.next()) {
+                    (None, _) => Command::SessionHelper { pipe: None },
+                    (Some("--probe"), None) => Command::SessionHelperProbe,
+                    (Some("--probe"), Some(other)) => {
+                        bail!("unknown argument {other:?} after session-helper --probe")
+                    }
+                    (Some("--pipe"), Some(name)) => Command::SessionHelper { pipe: Some(name) },
+                    (Some("--pipe"), None) => bail!("--pipe needs a name"),
+                    (Some(other), _) => bail!("unknown argument {other:?} after session-helper"),
+                };
                 if let Some(other) = args.next() {
-                    bail!("unknown argument {other:?} after session-helper --probe");
+                    bail!("unknown argument {other:?} after session-helper");
                 }
-                return Ok(Command::SessionHelperProbe);
+                return Ok(command);
             }
             #[cfg(windows)]
             "uninstall" => {
@@ -158,6 +171,8 @@ fn main() -> ExitCode {
         Ok(Command::Diagnose { config }) => return diagnose(config),
         #[cfg(windows)]
         Ok(Command::SessionHelperProbe) => return sources::probe(),
+        #[cfg(windows)]
+        Ok(Command::SessionHelper { pipe }) => return sources::session_helper(pipe.as_deref()),
         #[cfg(windows)]
         Ok(Command::Install { config }) => return sources::install(config.as_deref()),
         #[cfg(windows)]
@@ -337,13 +352,25 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn session_helper_probe_command() {
+    fn session_helper_commands() {
         assert_eq!(
             parse_args(args(&["session-helper", "--probe"])).unwrap(),
             Command::SessionHelperProbe
         );
-        assert!(parse_args(args(&["session-helper"])).is_err());
         assert!(parse_args(args(&["session-helper", "--probe", "x"])).is_err());
+        assert_eq!(
+            parse_args(args(&["session-helper"])).unwrap(),
+            Command::SessionHelper { pipe: None }
+        );
+        assert_eq!(
+            parse_args(args(&["session-helper", "--pipe", r"\\.\pipe\t"])).unwrap(),
+            Command::SessionHelper {
+                pipe: Some(r"\\.\pipe\t".to_string())
+            }
+        );
+        assert!(parse_args(args(&["session-helper", "--pipe"])).is_err());
+        assert!(parse_args(args(&["session-helper", "--pipe", "a", "b"])).is_err());
+        assert!(parse_args(args(&["session-helper", "--bogus"])).is_err());
     }
 
     #[cfg(windows)]

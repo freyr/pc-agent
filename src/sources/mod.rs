@@ -27,6 +27,9 @@ pub use macos::*;
 mod nvml;
 
 #[cfg(any(windows, test))]
+mod helper_rules;
+
+#[cfg(any(windows, test))]
 mod win_diagnose;
 
 #[cfg(any(windows, test))]

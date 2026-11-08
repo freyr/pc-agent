@@ -1,16 +1,24 @@
-//! The session helper: `pc-agent session-helper --probe` reads the input
-//! state once in the user session, and the start of it from the service
-//! (LocalSystem) in the console session. W6 adds the running helper.
+//! The session helper. `pc-agent session-helper` runs in the user session:
+//! each 1 s it reads `GetLastInputInfo` and the XInput slots, and sends the
+//! input time to the service over the pipe. `pc-agent session-helper
+//! --probe` reads the input state once, for `diagnose`. The start of both
+//! from the service (LocalSystem) in a user session is here too. The rules
+//! are in `helper_rules`.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::windows::io::FromRawHandle;
 use std::process::ExitCode;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_PIPE_BUSY, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+    WAIT_OBJECT_0,
 };
 use ::windows::Win32::Security::SECURITY_ATTRIBUTES;
+use ::windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+};
 use ::windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use ::windows::Win32::System::Pipes::CreatePipe;
 use ::windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
@@ -23,42 +31,151 @@ use ::windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTI
 use ::windows::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 use ::windows::core::{HSTRING, PWSTR};
 
+use super::super::helper_rules::{
+    HELPER_ACCESS, HelperMessage, PIPE_NAME, Pad, SendRule, gamepad_activity, keyboard_input,
+    merge_input,
+};
 use super::super::win_diagnose::{self, Probe, step_error, win32_code};
 use super::super::wts_rules::NO_CONSOLE;
 
 /// The longest wait for the probe to exit.
 const PROBE_WAIT_MS: u32 = 5_000;
 
-/// `pc-agent session-helper --probe`: one read, printed to stdout.
-pub fn probe() -> ExitCode {
+/// The interval of the input reads of the helper.
+const READ_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The tries to open the pipe while all its instances are busy.
+const OPEN_TRIES: u32 = 10;
+
+/// The age of the last keyboard or mouse input in ms (`GetLastInputInfo`);
+/// `None` when the read failed.
+fn last_input_age() -> Option<u32> {
     let mut info = LASTINPUTINFO {
         cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
         dwTime: 0,
     };
     // SAFETY: `info` is a valid LASTINPUTINFO with cbSize set.
-    let last = unsafe { GetLastInputInfo(&mut info) }.as_bool();
+    let ok = unsafe { GetLastInputInfo(&mut info) }.as_bool();
     // SAFETY: GetTickCount has no arguments and no preconditions.
     let now = unsafe { GetTickCount() };
+    ok.then(|| win_diagnose::tick_age(now, info.dwTime))
+}
+
+/// The state of XInput slot `slot` (0-3): the packet number and the
+/// gamepad; `None` when no controller is connected there.
+fn xinput(slot: u32) -> Option<(u32, Pad)> {
+    let mut state = XINPUT_STATE::default();
+    // SAFETY: `state` is a valid out pointer; slots 0-3 are the valid indexes.
+    if unsafe { XInputGetState(slot, &mut state) } != 0 {
+        return None;
+    }
+    let g = state.Gamepad;
+    Some((
+        state.dwPacketNumber,
+        Pad {
+            buttons: g.wButtons.0,
+            left_trigger: g.bLeftTrigger,
+            right_trigger: g.bRightTrigger,
+            thumb_lx: g.sThumbLX,
+            thumb_ly: g.sThumbLY,
+            thumb_rx: g.sThumbRX,
+            thumb_ry: g.sThumbRY,
+        },
+    ))
+}
+
+/// `pc-agent session-helper --probe`: one read, printed to stdout.
+pub fn probe() -> ExitCode {
+    let last = last_input_age();
     let mut slots = [None; 4];
     for (slot, packet) in slots.iter_mut().enumerate() {
-        let mut state = XINPUT_STATE::default();
-        // SAFETY: `state` is a valid out pointer; slots 0-3 are the valid indexes.
-        if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
-            *packet = Some(state.dwPacketNumber);
-        }
+        *packet = xinput(slot as u32).map(|(packet, _)| packet);
     }
-    if !last {
+    let Some(last_input_ms) = last else {
         eprintln!("GetLastInputInfo failed");
         return ExitCode::FAILURE;
-    }
+    };
     print!(
         "{}",
         win_diagnose::format_probe(&Probe {
-            last_input_ms: win_diagnose::tick_age(now, info.dwTime),
-            slots,
+            last_input_ms,
+            slots
         })
     );
     ExitCode::SUCCESS
+}
+
+/// `pc-agent session-helper [--pipe <name>]`: sends the input time of this
+/// session to the pipe (`\\.\pipe\pc-agent` by default) until the service
+/// closes it. The first value goes at once, then a change at most each 2 s.
+pub fn run(pipe: Option<&str>) -> ExitCode {
+    let mut out = match open_pipe(pipe.unwrap_or(PIPE_NAME)) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("cannot open the pipe: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut slots: [Option<(u32, Pad)>; 4] = [None; 4];
+    let mut gamepad = None;
+    let mut rule = SendRule::default();
+    loop {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        let keyboard = last_input_age().map(|age| keyboard_input(now_ms, age));
+        for (slot, prev) in slots.iter_mut().enumerate() {
+            let read = xinput(slot as u32);
+            if let Some((packet, pad)) = &read
+                && gamepad_activity(prev.as_ref().map(|(p, s)| (*p, s)), *packet, pad)
+            {
+                gamepad = Some(now_ms.div_euclid(1000));
+            }
+            *prev = read;
+        }
+        if let Some(t) = merge_input(keyboard, gamepad)
+            && rule.due(t, now_ms)
+            && out
+                .write_all(HelperMessage::LastInput(t).to_line().as_bytes())
+                .is_err()
+        {
+            // The service closed the pipe: it stopped or restarts.
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(READ_INTERVAL);
+    }
+}
+
+/// Opens the client end of the pipe `name` for writing. It asks only for
+/// the rights that the pipe DACL gives `INTERACTIVE`, and lets the server
+/// identify the user but not impersonate it.
+fn open_pipe(name: &str) -> Result<File, String> {
+    let wide = HSTRING::from(name);
+    let mut tries = 0;
+    loop {
+        // SAFETY: `wide` is a NUL-terminated name that outlives the call; the
+        // handle is owned by the File below.
+        let opened = unsafe {
+            CreateFileW(
+                &wide,
+                HELPER_ACCESS,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                None,
+            )
+        };
+        match opened {
+            // SAFETY: the handle is valid and owned by this File from here on.
+            Ok(handle) => return Ok(unsafe { File::from_raw_handle(handle.0) }),
+            Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() && tries < OPEN_TRIES => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(e) => return Err(failed("CreateFileW", &e)),
+        }
+    }
 }
 
 /// Starts the probe in the console session as the user of that session
@@ -70,27 +187,53 @@ pub fn start_probe() -> Result<(u32, Probe), String> {
     if session == NO_CONSOLE {
         return Err("no console session".to_string());
     }
+    let output = run_probe(session)?;
+    win_diagnose::parse_probe(&output).map(|probe| (session, probe))
+}
+
+/// Starts `pc-agent session-helper` in `session`. Gives the process ID and
+/// the process handle, which the caller closes.
+pub fn start_helper(session: u32) -> Result<(u32, HANDLE), String> {
+    let process = start_in_session(session, "session-helper", None)?;
+    // SAFETY: the thread handle is valid and not used after this.
+    unsafe {
+        let _ = CloseHandle(process.hThread);
+    }
+    Ok((process.dwProcessId, process.hProcess))
+}
+
+/// Starts `<this exe> <args>` in `session` as the user of that session, on
+/// the desktop `winsta0\default`, with no window. `stdout` (an inheritable
+/// handle) gets stdout and stderr. The caller closes the handles of the
+/// process information.
+fn start_in_session(
+    session: u32,
+    args: &str,
+    stdout: Option<HANDLE>,
+) -> Result<PROCESS_INFORMATION, String> {
     let mut token = HANDLE::default();
     // SAFETY: `token` is a valid out pointer; it is closed below.
     unsafe { WTSQueryUserToken(session, &mut token) }
         .map_err(|e| failed("WTSQueryUserToken", &e))?;
-    let result = start_as(token);
+    let result = start_as(token, args, stdout);
     // SAFETY: `token` came from WTSQueryUserToken and is not used after this.
     unsafe {
         let _ = CloseHandle(token);
     }
-    let output = result?;
-    win_diagnose::parse_probe(&output).map(|probe| (session, probe))
+    result
 }
 
-/// Runs `<this exe> session-helper --probe` with the user token `token` on
-/// the desktop `winsta0\default` and gives its stdout.
-fn start_as(token: HANDLE) -> Result<String, String> {
+/// `start_in_session` with the user token `token`.
+fn start_as(
+    token: HANDLE,
+    args: &str,
+    stdout: Option<HANDLE>,
+) -> Result<PROCESS_INFORMATION, String> {
     let mut env: *mut core::ffi::c_void = std::ptr::null_mut();
     // SAFETY: `env` is a valid out pointer; the block is destroyed below.
     unsafe { CreateEnvironmentBlock(&mut env, Some(token), false) }
         .map_err(|e| failed("CreateEnvironmentBlock", &e))?;
-    let result = start_with_env(token, env);
+    let result = start_with_env(token, env, args, stdout);
     // SAFETY: `env` came from CreateEnvironmentBlock and is not used after this.
     unsafe {
         let _ = DestroyEnvironmentBlock(env);
@@ -98,17 +241,55 @@ fn start_as(token: HANDLE) -> Result<String, String> {
     result
 }
 
-fn start_with_env(token: HANDLE, env: *mut core::ffi::c_void) -> Result<String, String> {
+fn start_with_env(
+    token: HANDLE,
+    env: *mut core::ffi::c_void,
+    args: &str,
+    stdout: Option<HANDLE>,
+) -> Result<PROCESS_INFORMATION, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
     let exe = HSTRING::from(exe.as_os_str());
     // CreateProcessAsUserW can write to the command line, so it is a
     // mutable, NUL-terminated buffer.
-    let mut command: Vec<u16> = format!("\"{exe}\" session-helper --probe")
+    let mut command: Vec<u16> = format!("\"{exe}\" {args}")
         .encode_utf16()
         .chain([0])
         .collect();
     let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain([0]).collect();
+    let mut startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        lpDesktop: PWSTR(desktop.as_mut_ptr()),
+        ..Default::default()
+    };
+    if let Some(out) = stdout {
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdOutput = out;
+        startup.hStdError = out;
+    }
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: the buffers outlive the call; `startup` and `process` are valid.
+    unsafe {
+        CreateProcessAsUserW(
+            Some(token),
+            &exe,
+            Some(PWSTR(command.as_mut_ptr())),
+            None,
+            None,
+            // Only the probe passes a handle (its stdout) to the child.
+            stdout.is_some(),
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            Some(env.cast_const()),
+            None,
+            &startup,
+            &mut process,
+        )
+    }
+    .map_err(|e| failed("CreateProcessAsUserW", &e))?;
+    Ok(process)
+}
 
+/// Runs `<this exe> session-helper --probe` in `session` and gives its stdout.
+fn run_probe(session: u32) -> Result<String, String> {
     let inherit = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
@@ -130,39 +311,14 @@ fn start_with_env(token: HANDLE, env: *mut core::ffi::c_void) -> Result<String, 
         }
         return Err(failed("SetHandleInformation", &e));
     }
-
-    let startup = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        lpDesktop: PWSTR(desktop.as_mut_ptr()),
-        dwFlags: STARTF_USESTDHANDLES,
-        hStdOutput: write,
-        hStdError: write,
-        ..Default::default()
-    };
-    let mut process = PROCESS_INFORMATION::default();
-    // SAFETY: the buffers outlive the call; `startup` and `process` are valid.
-    let created = unsafe {
-        CreateProcessAsUserW(
-            Some(token),
-            &exe,
-            Some(PWSTR(command.as_mut_ptr())),
-            None,
-            None,
-            true,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            Some(env.cast_const()),
-            None,
-            &startup,
-            &mut process,
-        )
-    };
+    let created = start_in_session(session, "session-helper --probe", Some(write));
     // The child has its copy of the write end: without this close, the read
     // below never sees the end of the pipe.
     // SAFETY: `write` is a valid handle, not used after this.
     unsafe {
         let _ = CloseHandle(write);
     }
-    created.map_err(|e| failed("CreateProcessAsUserW", &e))?;
+    let process = created?;
 
     // SAFETY: the handles of `process` are valid until they are closed here.
     let exit = unsafe {
@@ -198,6 +354,6 @@ fn start_with_env(token: HANDLE, env: *mut core::ffi::c_void) -> Result<String, 
 }
 
 /// The text of a failed Win32 step.
-fn failed(step: &str, e: &::windows::core::Error) -> String {
+pub(super) fn failed(step: &str, e: &::windows::core::Error) -> String {
     step_error(step, win32_code(e.code().0))
 }

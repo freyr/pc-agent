@@ -76,6 +76,12 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      # A unit test of a bin crate has no path to the built exe, so this
+      # test is ignored in `cargo test` and gets the exe here.
+      - name: Run the session helper against a test pipe
+        env:
+          PC_AGENT_EXE: target\release\pc-agent.exe
+        run: cargo test -- --ignored --nocapture the_helper_sends_last_input_over_a_test_pipe
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-x86_64-windows
@@ -240,6 +246,33 @@ jobs:
           if ($warnings.Count -ne 1) { throw "expected exactly one NVML init warning, got $($warnings.Count)" }
           $global:LASTEXITCODE = 0
 
+      - name: Check that the service starts the session helper
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $bin = 'homeassistant/binary_sensor/CI-TEST'
+          $config = & $env:MQTT_READ "$bin/inputhelper/config" 20
+          "inputhelper config: $config"
+          $json = $config | ConvertFrom-Json
+          if ($json.name -ne 'inputhelper' -or $json.device_class -ne 'running') { throw "bad inputhelper config" }
+          # The service runs as SYSTEM and starts the helper in the console
+          # session of runneradmin. The connect publishes OFF before the
+          # helper connects, so read the retained state until it is ON.
+          $state = ''
+          foreach ($i in 1..15) {
+            $state = & $env:MQTT_READ "$bin/inputhelper/state" 5
+            if ($state -eq 'ON') { break }
+            Start-Sleep -Seconds 2
+          }
+          "inputhelper: $state"
+          Select-String -Path C:\ProgramData\pc-agent\pc-agent.log -Pattern 'session helper|pipe' | ForEach-Object { $_.Line }
+          if ($state -ne 'ON') { throw "inputhelper is '$state', expected ON" }
+          $active = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/lastactive/state' 20
+          "lastactive: $active"
+          if ($active -notmatch '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z$') { throw "bad lastactive '$active'" }
+          Get-CimInstance Win32_Process -Filter "Name = 'pc-agent.exe'" |
+            ForEach-Object { "process $($_.ProcessId) session $($_.SessionId): $($_.CommandLine)" }
+          $global:LASTEXITCODE = 0
+
       - name: Uninstall the service
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
@@ -259,6 +292,9 @@ jobs:
           }
           if (-not $gone) { throw "the service pc-agent still exists" }
           if (-not (Test-Path C:\ProgramData\pc-agent\config.toml)) { throw "uninstall removed the configuration" }
+          # The helper exits at its next write to the closed pipe, after the
+          # next input; the runner gets no input, so end it here.
+          Get-Process pc-agent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $global:LASTEXITCODE = 0
 
       # After the uninstall, so diagnose cannot disturb the service checks;
