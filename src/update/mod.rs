@@ -5,10 +5,12 @@ mod check;
 mod install;
 mod key;
 pub(crate) mod pending;
+mod schedule;
 
 pub use check::{Channel, check_command};
 pub use install::update_command;
 pub use pending::{Paths, Start, Watch};
+pub use schedule::{Step, Updater};
 
 /// The test feature `update-test-exit`: the service path exits with a
 /// failure right after the pending-file check (a broken new build).

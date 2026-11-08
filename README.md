@@ -102,6 +102,13 @@ connect at its third start or within 10 min, the service moves `pc-agent.prev` b
 build as failed in `update-state.json` (in `/var/lib/pc-agent`, `/Library/Application
 Support/pc-agent` or `C:\ProgramData\pc-agent`).
 
+The service checks the channel 10 min after its start and then every 24 h, while it is connected
+to the broker. With `auto = true` (the default in `[update]`), a check installs a newer build when
+the last automatic install is 7 days old or more; `auto = false` stops the automatic install. The
+HA entity `update.<entity_prefix>_agent` shows the installed and the latest version. Its Install
+button checks at once and installs a newer build, also with `auto = false`. Neither the schedule
+nor HA installs a build that failed before; only `pc-agent update` does.
+
 To take over the entities of an existing HASS.Agent device, use its device name and identifier, and
 give its sensor IDs in a `[unique_ids]` section (`sessionstate`, `lastactive`, `lastboot`,
 `lastsystemstatechange`).
@@ -119,7 +126,7 @@ give its sensor IDs in a `[unique_ids]` section (`sessionstate`, `lastactive`, `
 | `scripts/package.sh`, `scripts/build-pkg.sh` | Release archives and the macOS package (used by CI). |
 | `scripts/manifest.sh`, `scripts/check-manifest.sh` | The release manifest of the bare binaries (signed in `release.yml`) and its CI check. |
 | `scripts/check-edge.sh` | The CI check of `pc-agent update --check` against the real `edge` release. |
-| `scripts/e2e-update.sh` | The CI end-to-end test of `pc-agent update` and of the rollback (Linux and macOS; builds of the test features `update-test-key` and `update-test-exit`, never in a release). |
+| `scripts/e2e-update.sh` | The CI end-to-end test of `pc-agent update`, of the rollback and of the install command of the HA update entity (Linux and macOS; builds of the test features `update-test-key` and `update-test-exit`, never in a release). |
 | `scripts/probe.sh`, `scripts/probe-macos.sh` | Signal probes from development. `pc-agent diagnose` replaces them. |
 
 ## Development

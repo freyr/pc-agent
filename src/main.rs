@@ -403,6 +403,8 @@ where
         entity_prefix = %cfg.device.entity_prefix,
         gpu = cfg.gpu.enabled,
         version = update::VERSION,
+        update_auto = cfg.update.auto,
+        update_channel = %cfg.update.channel,
         "starting pc-agent"
     );
 
@@ -416,6 +418,8 @@ where
         let stop = stop()?;
         let poll = move || sources::poll(gpu);
         let events = sources::events();
+        // In the runtime: the schedule starts on its clock.
+        let updater = update::Updater::system(&cfg.update);
         mqtt::run(
             &cfg,
             &model,
@@ -425,6 +429,7 @@ where
             sources::ACK_WAIT,
             stop,
             &mut watch,
+            updater,
         )
         .await
     })
