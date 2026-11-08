@@ -37,6 +37,10 @@ pub struct Entity {
     pub expire_after: Option<u32>,
     /// A new entity (not a HASS.Agent one) sets `default_entity_id` from `entity_prefix`.
     pub default_entity_id: bool,
+    /// Only the Windows agent supplies it. The agents of the other OSes publish
+    /// no empty config for it, so a Linux boot of a dual-boot PC does not
+    /// remove it.
+    pub windows_only: bool,
 }
 
 const fn sensor(name: &'static str, icon: &'static str) -> Entity {
@@ -50,6 +54,7 @@ const fn sensor(name: &'static str, icon: &'static str) -> Entity {
         payloads: None,
         expire_after: None,
         default_entity_id: false,
+        windows_only: false,
     }
 }
 
@@ -98,9 +103,20 @@ pub const DISPLAY: Entity = Entity {
     ..sensor("display", "mdi:monitor")
 };
 
+pub const INPUTHELPER: Entity = Entity {
+    component: Component::BinarySensor,
+    device_class: Some("running"),
+    payloads: Some(("ON", "OFF")),
+    expire_after: Some(LIVE_EXPIRE_AFTER),
+    default_entity_id: true,
+    windows_only: true,
+    ..sensor("inputhelper", "mdi:keyboard")
+};
+
 /// The entity table of the spec. The agent publishes the configs of the
-/// entities that the source supplies and empty configs for the rest.
-pub const ENTITIES: [Entity; 8] = [
+/// entities that the source supplies and empty configs for the rest (on
+/// other OSes than Windows, not for a Windows-only entity).
+pub const ENTITIES: [Entity; 9] = [
     SESSIONSTATE,
     LASTACTIVE,
     LASTBOOT,
@@ -109,6 +125,7 @@ pub const ENTITIES: [Entity; 8] = [
     GPUPOWER,
     LOGGEDUSERS,
     DISPLAY,
+    INPUTHELPER,
 ];
 
 /// The availability topic is under `sensor` for every entity, also for a binary sensor.
@@ -215,7 +232,7 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
     }
 
     #[test]
-    fn table_has_the_eight_entities_in_order() {
+    fn table_has_the_nine_entities_in_order() {
         let names: Vec<&str> = ENTITIES.iter().map(|e| e.name).collect();
         assert_eq!(
             names,
@@ -227,9 +244,16 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
                 "gpuload",
                 "gpupower",
                 "loggedusers",
-                "display"
+                "display",
+                "inputhelper"
             ]
         );
+        let windows_only: Vec<&str> = ENTITIES
+            .iter()
+            .filter(|e| e.windows_only)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(windows_only, ["inputhelper"]);
     }
 
     #[test]
@@ -318,6 +342,7 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
             ("gpupower", "sensor.jahu_rtx_gpupower"),
             ("loggedusers", "sensor.jahu_rtx_loggedusers"),
             ("display", "binary_sensor.jahu_rtx_display"),
+            ("inputhelper", "binary_sensor.jahu_rtx_inputhelper"),
         ];
         for (name, id) in expected {
             let v = payload(name);
@@ -374,6 +399,22 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
         assert_eq!(
             config_topic("JAHURTX", &DISPLAY),
             "homeassistant/binary_sensor/JAHURTX/display/config"
+        );
+    }
+
+    #[test]
+    fn inputhelper_is_a_running_binary_sensor() {
+        let v = payload("inputhelper");
+        assert_eq!(v["device_class"], "running");
+        assert_eq!(v["payload_on"], "ON");
+        assert_eq!(v["payload_off"], "OFF");
+        assert_eq!(
+            v["state_topic"],
+            "homeassistant/binary_sensor/JAHURTX/inputhelper/state"
+        );
+        assert_eq!(
+            v["availability_topic"],
+            "homeassistant/sensor/JAHURTX/availability"
         );
     }
 

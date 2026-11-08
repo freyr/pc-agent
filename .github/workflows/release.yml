@@ -80,8 +80,36 @@ jobs:
             dist/pc-agent-*-macos.pkg.sha256
           if-no-files-found: error
 
+  # W8 replaces the bare exe with pc-agent-x86_64-windows.zip.
+  windows:
+    needs: check
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Copy the exe and write its checksum
+        run: |
+          $name = "pc-agent-x86_64-windows.exe"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\pc-agent.exe "dist\$name"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist\$name").Hash.ToLower()
+          # The format of sha256sum, so `sha256sum -c` checks it.
+          [IO.File]::WriteAllText("$PWD\dist\$name.sha256", "$hash  $name`n")
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pc-agent-x86_64-windows
+          path: |
+            dist/pc-agent-x86_64-windows.exe
+            dist/pc-agent-x86_64-windows.exe.sha256
+          if-no-files-found: error
+
   release:
-    needs: [linux, macos]
+    needs: [linux, macos, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
