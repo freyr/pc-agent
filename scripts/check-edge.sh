@@ -22,7 +22,7 @@ for attempt in 1 2 3 4 5; do
   echo "== attempt $attempt"
   if out="$("$exe" update --check --channel edge 2>&1)"; then
     echo "$out"
-    expected="$(curl -fsSL "$url" | sed -n 's/.*"commit": *"\([0-9a-f]\{40\}\)".*/\1/p')"
+    expected="$(curl -fsSL "$url" | sed -n 's/.*"commit": *"\([0-9a-f]\{40\}\)".*/\1/p')" || true
     if [[ -n "$expected" ]] && grep -q "^manifest: .* commit $expected " <<<"$out"; then
       echo "OK: the check prints the edge commit $expected"
       exit 0
