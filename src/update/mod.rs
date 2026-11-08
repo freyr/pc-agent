@@ -2,9 +2,17 @@
 //! (`check`) and the install (U3 and later) build on `verify`.
 
 mod check;
+mod install;
 mod key;
+pub(crate) mod pending;
 
 pub use check::{Channel, check_command};
+pub use install::update_command;
+pub use pending::{Paths, Start, Watch};
+
+/// The test feature `update-test-exit`: the service path exits with a
+/// failure right after the pending-file check (a broken new build).
+pub const TEST_EXIT: bool = cfg!(feature = "update-test-exit");
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,10 +23,72 @@ use anyhow::{Context, Result, anyhow};
 use minisign_verify::{PublicKey, Signature};
 use serde::Deserialize;
 
+/// The version of this build: the Cargo version (a test build of the
+/// feature `update-test-key` can set another one; see `build.rs`).
+pub const VERSION: &str = env!("PC_AGENT_VERSION");
 /// The commit of this build (full hash), or `unknown`; see `build.rs`.
 pub const COMMIT: &str = env!("PC_AGENT_COMMIT");
 /// The build time of this binary (UTC, RFC 3339); see `build.rs`.
 pub const BUILT_AT: &str = env!("PC_AGENT_BUILD_TIME");
+
+/// The pending-file check of a service start (the first step of the
+/// service path, before the configuration, the log and the OS init) and the
+/// watch of the run loop. The caller logs the result with `log_start` after
+/// the log init, and exits when `Start::must_exit` is true.
+pub fn service_start() -> (Start, Watch) {
+    let now = chrono::Utc::now();
+    match Paths::system() {
+        Ok(paths) => {
+            let start = pending::on_start(&paths, now);
+            let watch = Watch::new(paths, &start, now);
+            (start, watch)
+        }
+        Err(e) => (Start::Error(format!("{e:#}")), Watch::none()),
+    }
+}
+
+/// Logs the result of the pending-file check.
+pub fn log_start(start: &Start) {
+    match start {
+        Start::Normal => {}
+        Start::Pending {
+            starts,
+            deadline,
+            new,
+        } => tracing::info!(
+            version = %new.version,
+            commit = %new.commit,
+            start = starts,
+            "new build: the first ConnAck before {deadline} confirms it"
+        ),
+        Start::RolledBack(failed) => tracing::warn!(
+            version = %failed.version,
+            commit = %failed.commit,
+            "the new build got no ConnAck: rolled back to the old binary"
+        ),
+        Start::RollbackFailed(e) => tracing::error!("the rollback failed: {e}"),
+        Start::Error(e) => tracing::warn!("update check at start: {e}"),
+    }
+}
+
+/// The base URL of the releases. In a build of the test feature
+/// `update-test-key` only, `PC_AGENT_UPDATE_URL` replaces it (the CI test).
+pub fn base_url() -> String {
+    #[cfg(feature = "update-test-key")]
+    if let Ok(url) = std::env::var("PC_AGENT_UPDATE_URL") {
+        return url;
+    }
+    check::BASE_URL.to_string()
+}
+
+/// The key that signs the manifest. A build of the test feature
+/// `update-test-key` has the test key of `build.rs` instead of the project key.
+pub fn public_key() -> &'static str {
+    #[cfg(feature = "update-test-key")]
+    return env!("PC_AGENT_TEST_PUBLIC_KEY");
+    #[cfg(not(feature = "update-test-key"))]
+    return key::PUBLIC_KEY;
+}
 
 /// `manifest.json` of a release; `scripts/manifest.sh` writes it.
 #[derive(Debug, Deserialize, PartialEq)]
@@ -82,7 +152,7 @@ pub fn verify_files(manifest: &Path, signature: &Path, public_key: &Path) -> Exi
                     asset.asset, asset.sha256
                 );
             }
-            println!("running version: {}", env!("CARGO_PKG_VERSION"));
+            println!("running version: {VERSION}");
             println!("running commit: {COMMIT}");
             println!("running built_at: {BUILT_AT}");
             ExitCode::SUCCESS
@@ -157,6 +227,13 @@ mod tests {
             "{COMMIT}"
         );
         assert!(BUILT_AT.ends_with('Z'), "{BUILT_AT}");
+        // Only a test build can have another version.
+        #[cfg(not(feature = "update-test-key"))]
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+        #[cfg(not(feature = "update-test-key"))]
+        assert_eq!(public_key(), key::PUBLIC_KEY);
+        #[cfg(not(feature = "update-test-key"))]
+        assert_eq!(base_url(), check::BASE_URL);
         chrono::DateTime::parse_from_rfc3339(BUILT_AT).unwrap();
     }
 }

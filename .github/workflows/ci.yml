@@ -18,6 +18,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy with the update test features
+        run: cargo clippy --all-targets --features update-test-key,update-test-exit -- -D warnings
       - run: cargo test
       - run: cargo build --release
       - run: bash scripts/package.sh dist
@@ -30,6 +32,22 @@ jobs:
       # print its commit, whether this build is newer, older or the same.
       - name: Check the edge release with update --check
         run: bash scripts/check-edge.sh target/release/pc-agent
+      # The test seams of the update (a test key, a test URL, a test
+      # version) must never reach a release or the release-mode CI build.
+      - name: Check that no release build enables an update test feature
+        run: |
+          if grep -n 'update-test' .github/workflows/release.yml; then
+            echo "::error::release.yml enables an update test feature" >&2
+            exit 1
+          fi
+          if grep -nE 'run: cargo build --release.*--features' .github/workflows/*.yml; then
+            echo "::error::a release build of a workflow enables a feature" >&2
+            exit 1
+          fi
+      - name: Update the service end to end (systemd)
+        run: |
+          sudo apt-get install -y -q mosquitto mosquitto-clients
+          bash scripts/e2e-update.sh
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-x86_64-linux
@@ -58,6 +76,10 @@ jobs:
       # print its commit, whether this build is newer, older or the same.
       - name: Check the edge release with update --check
         run: bash scripts/check-edge.sh target/release/pc-agent
+      - name: Update the service end to end (launchd)
+        run: |
+          brew install mosquitto
+          bash scripts/e2e-update.sh
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-aarch64-macos
@@ -91,6 +113,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy with the update test features
+        run: cargo clippy --all-targets --features update-test-key,update-test-exit -- -D warnings
       - run: cargo test
       - run: cargo build --release
       # A unit test of a bin crate has no path to the built exe, so this
@@ -468,6 +492,153 @@ jobs:
           $lines
           if ($lines.Count -eq 0) { throw "the broker log has no connect of pc-agent-diagnose-CI-TEST" }
           if ($lines | Where-Object { $_ -match 'PUBLISH from pc-agent-diagnose' }) { throw "diagnose published a message" }
+          $global:LASTEXITCODE = 0
+
+      # The update end to end: a throwaway minisign key (the runner has no
+      # minisign package, so the job takes the exe of the minisign release),
+      # and three builds of the test feature: 0.0.1, 0.0.2, and 0.0.3 that
+      # exits after the pending-file check.
+      - name: Build the update test agents
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $e2e = Join-Path $env:RUNNER_TEMP 'e2e'
+          New-Item -ItemType Directory -Force -Path $e2e | Out-Null
+          $zip = Join-Path $e2e 'minisign.zip'
+          curl.exe --fail --location --retry 5 --retry-all-errors --retry-delay 5 --output $zip `
+            'https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip'
+          if ($LASTEXITCODE -ne 0) { throw "the minisign download failed" }
+          Expand-Archive -Path $zip -DestinationPath "$e2e\minisign" -Force
+          $minisign = (Get-ChildItem "$e2e\minisign" -Recurse -Filter minisign.exe | Select-Object -First 1).FullName
+          if (-not $minisign) { throw "no minisign.exe in the zip" }
+          & $minisign -G -W -p "$e2e\test.pub" -s "$e2e\test.key"
+          if ($LASTEXITCODE -ne 0) { throw "minisign -G failed" }
+          $env:PC_AGENT_TEST_PUBLIC_KEY = (Get-Content "$e2e\test.pub")[-1].Trim()
+          # No debug info, as in scripts/e2e-update.sh.
+          $env:CARGO_PROFILE_DEV_DEBUG = "0"
+          $builds = @(
+            @{ Version = '0.0.1'; Features = 'update-test-key' },
+            @{ Version = '0.0.2'; Features = 'update-test-key' },
+            @{ Version = '0.0.3'; Features = 'update-test-key,update-test-exit' }
+          )
+          foreach ($b in $builds) {
+            $env:PC_AGENT_TEST_VERSION = $b.Version
+            cargo build --features $b.Features --target-dir target\e2e
+            if ($LASTEXITCODE -ne 0) { throw "the build of $($b.Version) failed" }
+            Copy-Item target\e2e\debug\pc-agent.exe "$e2e\pc-agent-$($b.Version).exe"
+          }
+          "E2E=$e2e" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MINISIGN=$minisign" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $global:LASTEXITCODE = 0
+
+      # The service runs from C:\Program Files\pc-agent, as on a PC. Run 1:
+      # pc-agent update installs 0.0.2, and the first ConnAck confirms it.
+      # Run 2: 0.0.3 fails twice (a non-crash stop, so the flag must be on
+      # for the restart), the third start rolls back to 0.0.2 and records
+      # the failed build.
+      - name: Update the service with pc-agent update and roll back a broken build
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $dir = 'C:\Program Files\pc-agent'
+          $bin = "$dir\pc-agent.exe"
+          $state = 'C:\ProgramData\pc-agent'
+          $cfg = Join-Path $env:RUNNER_TEMP 'ci-config.toml'
+          $topic = 'homeassistant/sensor/CI-TEST/lastboot/config'
+          $commit2 = '2222222222222222222222222222222222222222'
+          $commit3 = '3333333333333333333333333333333333333333'
+          $www = Join-Path $env:E2E 'www'
+          $dl = "$www\latest\download"
+          New-Item -ItemType Directory -Force -Path $dl, $dir | Out-Null
+          $server = Start-Process -FilePath python -PassThru -NoNewWindow `
+            -ArgumentList '-m', 'http.server', '18080', '--bind', '127.0.0.1', '--directory', $www `
+            -RedirectStandardOutput "$env:E2E\http-out.log" -RedirectStandardError "$env:E2E\http-err.log"
+          function Publish-Release($version, $commit, $file) {
+            Copy-Item $file "$dl\pc-agent-x86_64-windows.exe" -Force
+            $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            $json = @"
+          {
+            "version": "$version",
+            "commit": "$commit",
+            "built_at": "2026-11-08T12:00:00Z",
+            "platforms": {
+              "x86_64-windows": { "asset": "pc-agent-x86_64-windows.exe", "sha256": "$sha" }
+            }
+          }
+          "@
+            [IO.File]::WriteAllText("$dl\manifest.json", $json)
+            Remove-Item "$dl\manifest.json.minisig" -ErrorAction SilentlyContinue
+            & $env:MINISIGN -S -s "$env:E2E\test.key" -m "$dl\manifest.json" -x "$dl\manifest.json.minisig" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "minisign -S failed" }
+          }
+          function Wait-Until($seconds, $what, [scriptblock]$condition) {
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            while ($clock.Elapsed.TotalSeconds -lt $seconds) {
+              if (& $condition) { return }
+              Start-Sleep -Seconds 1
+            }
+            throw "$what within $seconds s"
+          }
+          function Get-SwVersion {
+            $config = & $env:MQTT_READ $topic 3
+            if ($config) { ($config | ConvertFrom-Json).device.sw_version }
+          }
+          function Wait-Version($expected, $seconds) {
+            Wait-Until $seconds "no sw_version $expected" { (Get-SwVersion) -eq $expected }
+            "sw_version: $expected"
+          }
+          function Same-File($a, $b) { (Get-FileHash $a).Hash -eq (Get-FileHash $b).Hash }
+          try {
+            Copy-Item "$env:E2E\pc-agent-0.0.1.exe" $bin -Force
+            & $bin install --config $cfg
+            if ($LASTEXITCODE -ne 0) { throw "pc-agent install failed" }
+            $flag = sc.exe qfailureflag pc-agent
+            $flag
+            if (-not ($flag -match 'TRUE')) { throw "install did not set the failure actions on non-crash failures" }
+            # Each start sets the flag again (for a PC installed before the updater).
+            sc.exe failureflag pc-agent 0 | Out-Null
+            if (-not ((sc.exe qfailureflag pc-agent) -match 'FALSE')) { throw "cannot clear the flag" }
+            sc.exe start pc-agent | Out-Null
+            Wait-Version '0.0.1' 60
+            $flag = sc.exe qfailureflag pc-agent
+            if (-not ($flag -match 'TRUE')) { throw "the service start did not set the flag again: $flag" }
+
+            $env:PC_AGENT_UPDATE_URL = 'http://127.0.0.1:18080'
+            Publish-Release '0.0.2' $commit2 "$env:E2E\pc-agent-0.0.2.exe"
+            & $bin update --channel stable --config $cfg
+            if ($LASTEXITCODE -ne 0) { throw "pc-agent update failed" }
+            if (-not (Same-File $bin "$env:E2E\pc-agent-0.0.2.exe")) { throw "the exe is not 0.0.2 after the install" }
+            Wait-Version '0.0.2' 90
+            Wait-Until 30 "update-pending.json or pc-agent.prev.exe is still there after the ConnAck" {
+              -not (Test-Path "$state\update-pending.json") -and -not (Test-Path "$dir\pc-agent.prev.exe")
+            }
+            "OK: 0.0.2 runs and the update is confirmed"
+            $again = & $bin update --channel stable --config $cfg
+            $again
+            if (-not ($again -contains 'up to date')) { throw "a second update did not print 'up to date'" }
+
+            mosquitto_pub -h 127.0.0.1 -r -n -t $topic
+            Publish-Release '0.0.3' $commit3 "$env:E2E\pc-agent-0.0.3.exe"
+            & $bin update --channel stable --config $cfg
+            if ($LASTEXITCODE -ne 0) { throw "pc-agent update to 0.0.3 failed" }
+            Wait-Until 180 "no rollback of 0.0.3" {
+              (Test-Path "$state\update-state.json") -and
+                (Select-String -Path "$state\update-state.json" -SimpleMatch $commit3 -Quiet) -and
+                -not (Test-Path "$state\update-pending.json")
+            }
+            Get-Content "$state\update-state.json"
+            if (-not (Same-File $bin "$env:E2E\pc-agent-0.0.2.exe")) { throw "the exe is not 0.0.2 after the rollback" }
+            # The retained config was cleared: only the old build can publish it again.
+            Wait-Version '0.0.2' 90
+            Select-String -Path "$state\pc-agent.log" -Pattern 'ConnAck|rolled back|update-test-exit|new build' |
+              ForEach-Object { $_.Line }
+            "OK: 0.0.3 failed, 0.0.2 is back and the failed build is recorded"
+            $check = & $bin update --check --channel stable --config $cfg
+            $check
+            if (-not ($check -match "^newer build failed before: 0.0.3 commit $commit3")) { throw "update --check does not report the failed build" }
+          } finally {
+            & $bin uninstall
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
+            Get-ChildItem $dir -ErrorAction SilentlyContinue | ForEach-Object { "left in ${dir}: $($_.Name)" }
+          }
           $global:LASTEXITCODE = 0
 
       - name: Show the logs

@@ -12,11 +12,22 @@ rumqttc = { version = "0.25.1", default-features = false }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.10.9"
 tokio = { version = "1.54.1", features = ["rt", "macros", "signal", "time", "sync", "process", "net", "io-util"] }
 toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+
+[features]
+# Test seams of the update end-to-end test in CI; never in a release build.
+# `update-test-key`: the public key comes from PC_AGENT_TEST_PUBLIC_KEY at
+# build time, PC_AGENT_UPDATE_URL replaces the release URL at run time, and
+# PC_AGENT_TEST_VERSION replaces the version at build time (build.rs).
+update-test-key = []
+# The service path exits with a failure right after the pending-file check,
+# as a broken new build.
+update-test-exit = []
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["test-util"] }

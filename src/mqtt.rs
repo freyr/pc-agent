@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::core::{Core, Snapshot, State, SystemEvent};
 use crate::entities::{self, Entity};
+use crate::update::Watch;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// Capacity of the request channel. Larger than the burst of one connect, so
@@ -22,6 +23,18 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub const ONLINE: &str = "online";
 pub const OFFLINE: &str = "offline";
+
+/// Why the run loop ended.
+#[derive(Debug, PartialEq)]
+pub enum Exit {
+    /// `stop` completed: the agent published `offline` and disconnected.
+    Stopped,
+    /// The service must start again (the rollback of an update; U4 adds the
+    /// restart after an install): a clean DISCONNECT with no `offline`, so
+    /// HA keeps `online`, and the caller exits so that the service manager
+    /// starts the binary at the binary path.
+    Restart,
+}
 
 /// One message to publish (always retained, QoS 1).
 #[derive(Debug, PartialEq)]
@@ -350,7 +363,10 @@ impl Session {
 /// Runs the agent until `stop` completes, then publishes `offline` and disconnects.
 /// `model` is the device model of the discovery configs. Every 2 s, `poll`
 /// gives a snapshot to `core`; `events` gives the sleep, wake and session
-/// events. `ack_wait` is the longest wait for the ack of `offline`.
+/// events. `ack_wait` is the longest wait for the ack of `offline`. The
+/// first ConnAck confirms a pending update of `watch`; with no ConnAck
+/// before its deadline, `watch` rolls back and the loop ends with a restart.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<P, F>(
     cfg: &Config,
     model: &str,
@@ -359,7 +375,8 @@ pub async fn run<P, F>(
     mut events: mpsc::Receiver<SystemEvent>,
     ack_wait: Duration,
     stop: F,
-) -> Result<()>
+    watch: &mut Watch,
+) -> Result<Exit>
 where
     P: FnMut() -> Snapshot,
     F: Future<Output = ()>,
@@ -385,9 +402,14 @@ where
     let mut suspend = SuspendWait::new(ack_wait);
     let mut pause = Pause::default();
 
-    loop {
+    let exit = loop {
         tokio::select! {
-            _ = &mut stop => break,
+            _ = &mut stop => break Exit::Stopped,
+            _ = tokio::time::sleep_until(watch.deadline().unwrap_or_else(tokio::time::Instant::now)),
+                if watch.deadline().is_some() => {
+                watch.rollback();
+                break Exit::Restart;
+            }
             _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)),
                 if retry_at.is_some() => retry_at = None,
             _ = poll_tick.tick(), if connected && pause.tick_allowed() => {
@@ -424,6 +446,7 @@ where
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!(host = %cfg.mqtt.host, port = cfg.mqtt.port, "connected to broker");
                     connected = true;
+                    watch.connected();
                     pause.on_connect();
                     // rumqttc clears its pending queue at a clean-session connect.
                     session.queued = 0;
@@ -449,11 +472,17 @@ where
                 }
             }
         }
-    }
+    };
 
     suspend.finish();
-    shutdown(&mut session, cfg, ack_wait).await;
-    Ok(())
+    match exit {
+        Exit::Stopped => shutdown(&mut session, cfg, ack_wait).await,
+        Exit::Restart => {
+            info!("restarting: disconnect with no offline");
+            disconnect(&mut session).await;
+        }
+    }
+    Ok(exit)
 }
 
 async fn shutdown(session: &mut Session, cfg: &Config, ack_wait: Duration) {
@@ -478,7 +507,11 @@ async fn shutdown(session: &mut Session, cfg: &Config, ack_wait: Duration) {
         Ok(()) => info!("offline acknowledged"),
         Err(_) => warn!("no ack for offline within {ack_wait:?}"),
     }
+    disconnect(session).await;
+}
 
+/// A clean DISCONNECT: the broker sends no last will.
+async fn disconnect(session: &mut Session) {
     if let Err(e) = session.client.try_disconnect() {
         warn!(error = %e, "cannot queue disconnect");
         return;
@@ -865,6 +898,63 @@ enabled = false
         suspend.start(done, None, tokio::time::Instant::now());
         assert_eq!(rx.try_recv(), Ok(()));
         assert_eq!(suspend.deadline(), None);
+    }
+
+    /// With no broker, the run loop ends at the deadline of the update
+    /// watch with a restart, after the rollback.
+    #[tokio::test(start_paused = true)]
+    async fn the_rollback_deadline_ends_the_run_with_a_restart() {
+        use crate::update::pending::{BuildId, Paths, Pending, Start, Watch, write_pending};
+        // A port that nothing listens on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let text = CFG
+            .replace("broker.example", "127.0.0.1")
+            .replace("1884", &port.to_string());
+        let cfg = Config::parse(&text).unwrap();
+        let root = std::env::temp_dir().join(format!("pc-agent-mqtt-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = Paths {
+            state_dir: root.clone(),
+            exe: root.join(if cfg!(windows) {
+                "pc-agent.exe"
+            } else {
+                "pc-agent"
+            }),
+        };
+        std::fs::write(&paths.exe, "new build").unwrap();
+        std::fs::write(paths.prev(), "old build").unwrap();
+        let build = |commit: &str| BuildId {
+            version: "0.3.0".to_string(),
+            commit: commit.to_string(),
+        };
+        write_pending(&paths, &Pending::new(build("old"), build("new"))).unwrap();
+        let now = chrono::Utc::now();
+        let start = Start::Pending {
+            starts: 1,
+            deadline: now + chrono::TimeDelta::seconds(60),
+            new: build("new"),
+        };
+        let mut watch = Watch::new(paths.clone(), &start, now);
+        let (_events_tx, events) = mpsc::channel(1);
+        let core = Core::new(&[], None);
+        let exit = run(
+            &cfg,
+            "model",
+            core,
+            Snapshot::default,
+            events,
+            Duration::from_secs(2),
+            std::future::pending::<()>(),
+            &mut watch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, Exit::Restart);
+        assert_eq!(std::fs::read_to_string(&paths.exe).unwrap(), "old build");
+        assert!(!paths.pending().exists());
     }
 
     #[tokio::test(start_paused = true)]

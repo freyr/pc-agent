@@ -164,7 +164,7 @@ pub fn discovery_payload(cfg: &Config, entity: &Entity, model: &str) -> Value {
             "name": device,
             "manufacturer": "pc-agent",
             "model": model,
-            "sw_version": env!("CARGO_PKG_VERSION"),
+            "sw_version": crate::update::VERSION,
         },
     });
     if let Some(class) = entity.device_class {
@@ -432,7 +432,7 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
             assert_eq!(d["name"], "JAHURTX");
             assert_eq!(d["manufacturer"], "pc-agent");
             assert_eq!(d["model"], "3.1.0");
-            assert_eq!(d["sw_version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(d["sw_version"], crate::update::VERSION);
         }
     }
 

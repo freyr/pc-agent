@@ -1,4 +1,5 @@
-//! `pc-agent install` and `pc-agent uninstall`.
+//! `pc-agent install` and `pc-agent uninstall`, and the service restart of
+//! `pc-agent update`.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -18,6 +19,7 @@ use ::windows::Win32::Security::{
 use ::windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
 use ::windows::core::{BOOL, HSTRING, PCWSTR, w};
 use anyhow::{Context, Result};
+use windows_service::service::Service;
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
     ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
@@ -32,7 +34,7 @@ const DESCRIPTION: &str = "Publishes the state of this PC to Home Assistant over
 /// The example configuration that `install` writes when no config.toml exists.
 const EXAMPLE_CONFIG: &str = include_str!("../../../packaging/config.example.toml");
 
-/// The time that `uninstall` waits for the service to stop.
+/// The time that `uninstall` and `update` wait for the service to stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `pc-agent install [--config <path>]`.
@@ -120,6 +122,11 @@ fn try_install(config: Option<&Path>) -> Result<()> {
             actions: Some(vec![restart.clone(), restart.clone(), restart]),
         })
         .context("cannot set the failure actions")?;
+    // A restart after a self-update reports Stopped with an exit code that
+    // is not 0: the failure actions must run for it too.
+    service
+        .set_failure_actions_on_non_crash_failures(true)
+        .context("cannot set the failure actions on non-crash failures")?;
     service
         .set_preshutdown_timeout(Duration::from_secs(10))
         .context("cannot set the preshutdown timeout")?;
@@ -196,6 +203,55 @@ fn protect(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Sets the flag "failure actions on non-crash failures" of the service, at
+/// each start of the service.
+pub(super) fn restart_on_non_crash_failures() -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("cannot open the service manager")?;
+    let service = manager
+        .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+        .with_context(|| format!("cannot open the service {SERVICE_NAME}"))?;
+    service.set_failure_actions_on_non_crash_failures(true)?;
+    Ok(())
+}
+
+/// Stops the service (when it runs) and starts it again: the restart of
+/// `pc-agent update` after an install.
+pub fn restart_service() -> Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("cannot open the service manager (run as administrator)")?;
+    let service = manager
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
+        )
+        .with_context(|| format!("cannot open the service {SERVICE_NAME}"))?;
+    stop_and_wait(&service)?;
+    service
+        .start::<&str>(&[])
+        .with_context(|| format!("cannot start the service {SERVICE_NAME}"))?;
+    Ok(())
+}
+
+/// Stops the service when it runs and waits until it is stopped.
+fn stop_and_wait(service: &Service) -> Result<()> {
+    if service.query_status()?.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    service.stop().context("cannot stop the service")?;
+    let start = Instant::now();
+    while service.query_status()?.current_state != ServiceState::Stopped {
+        if start.elapsed() > STOP_TIMEOUT {
+            anyhow::bail!(
+                "the service did not stop within {} s",
+                STOP_TIMEOUT.as_secs()
+            );
+        }
+        sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
 fn try_uninstall() -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("cannot open the service manager (run as administrator)")?;
@@ -207,19 +263,7 @@ fn try_uninstall() -> Result<()> {
         .with_context(|| format!("cannot open the service {SERVICE_NAME}"))?;
 
     // Stop first, so the agent publishes `offline` before the delete.
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        service.stop().context("cannot stop the service")?;
-        let start = Instant::now();
-        while service.query_status()?.current_state != ServiceState::Stopped {
-            if start.elapsed() > STOP_TIMEOUT {
-                anyhow::bail!(
-                    "the service did not stop within {} s",
-                    STOP_TIMEOUT.as_secs()
-                );
-            }
-            sleep(Duration::from_millis(250));
-        }
-    }
+    stop_and_wait(&service)?;
     service.delete().context("cannot delete the service")?;
     println!("deleted the service {SERVICE_NAME}; the configuration in {DATA_DIR} stays");
     Ok(())
