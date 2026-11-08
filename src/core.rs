@@ -69,8 +69,8 @@ pub struct Snapshot {
     pub gpu: Option<GpuSample>,
 }
 
-/// The sleep and wake events that a source sends to the core.
-// Linux sends no events yet (task 9).
+/// The sleep, wake and shutdown events that a source sends to the core.
+// Each OS sends only some of the variants.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum SystemEvent {
@@ -80,6 +80,12 @@ pub enum SystemEvent {
     Suspend { done: oneshot::Sender<()> },
     /// The system woke up.
     Resume,
+    /// The system shuts down. The core publishes the `SystemShutdown` state
+    /// and `offline`, then completes `done` as for `Suspend`. No state is
+    /// published after it, until `ShutdownCancelled`.
+    Shutdown { done: oneshot::Sender<()> },
+    /// The shutdown was cancelled: `online` again, no `lastsystemstatechange`.
+    ShutdownCancelled,
 }
 
 /// The current state of the supplied entities.

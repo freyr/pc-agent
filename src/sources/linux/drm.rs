@@ -26,6 +26,7 @@ pub fn connectors(drm_dir: &Path) -> Vec<Connector> {
                     .map(|s| s.trim().to_string())
             };
             Some(Connector {
+                name: e.file_name().to_string_lossy().to_string(),
                 status: read("status")?,
                 dpms: read("dpms")?,
             })
@@ -60,10 +61,12 @@ mod tests {
             list,
             [
                 Connector {
+                    name: "card1-DP-1".into(),
                     status: "connected".into(),
                     dpms: "Off".into()
                 },
                 Connector {
+                    name: "card1-HDMI-A-1".into(),
                     status: "disconnected".into(),
                     dpms: "On".into()
                 },

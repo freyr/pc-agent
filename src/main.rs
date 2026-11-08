@@ -18,8 +18,13 @@ use crate::core::Core;
 
 const USAGE: &str = "\
 Usage: pc-agent [--config <path>]
+       pc-agent diagnose
 
 Publishes the state of this PC to Home Assistant over MQTT.
+
+Commands:
+  diagnose         Print what each source reads and what the agent makes of
+                   it, once, then exit (Linux; run it with sudo). Needs no config.
 
 Options:
   --config <path>  Config file (default: /etc/pc-agent/config.toml)
@@ -30,6 +35,7 @@ Log level: RUST_LOG (default: info)";
 #[derive(Debug, PartialEq)]
 enum Command {
     Run { config: PathBuf },
+    Diagnose,
     Help,
 }
 
@@ -39,6 +45,12 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
+            "diagnose" => {
+                if let Some(other) = args.next() {
+                    bail!("unknown argument {other:?} after diagnose");
+                }
+                return Ok(Command::Diagnose);
+            }
             "--config" => match args.next() {
                 Some(path) => config = PathBuf::from(path),
                 None => bail!("--config needs a path"),
@@ -55,6 +67,7 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
+        Ok(Command::Diagnose) => return diagnose(),
         Ok(Command::Run { config }) => config,
         Err(e) => {
             eprintln!("error: {e}\n\n{USAGE}");
@@ -72,6 +85,23 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `pc-agent diagnose`: runs the checks of the OS source once.
+fn diagnose() -> ExitCode {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => {
+            runtime.block_on(sources::diagnose());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: cannot start the runtime: {e}");
             ExitCode::FAILURE
         }
     }
@@ -140,6 +170,12 @@ mod tests {
     fn help_flag() {
         assert_eq!(parse_args(args(&["--help"])).unwrap(), Command::Help);
         assert_eq!(parse_args(args(&["-h"])).unwrap(), Command::Help);
+    }
+
+    #[test]
+    fn diagnose_command() {
+        assert_eq!(parse_args(args(&["diagnose"])).unwrap(), Command::Diagnose);
+        assert!(parse_args(args(&["diagnose", "--bogus"])).is_err());
     }
 
     #[test]

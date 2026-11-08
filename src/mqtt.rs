@@ -100,8 +100,9 @@ fn availability_message(cfg: &Config, payload: &str) -> Message {
 }
 
 /// Handles one event of the source: its `lastsystemstatechange` state, then
-/// the availability. For `Suspend`, `offline` is the last publish, and the
-/// reply comes back to the caller, which completes it after the ack wait.
+/// the availability. For `Suspend` and `Shutdown`, `offline` is the last
+/// publish, and the reply comes back to the caller, which completes it after
+/// the ack wait.
 fn handle_event(
     cfg: &Config,
     core: &mut Core,
@@ -123,6 +124,47 @@ fn handle_event(
             publish(availability_message(cfg, ONLINE));
             None
         }
+        SystemEvent::Shutdown { done } => {
+            for (entity, value) in core.event("SystemShutdown") {
+                publish(state_message(cfg, entity, value));
+            }
+            publish(availability_message(cfg, OFFLINE));
+            Some(done)
+        }
+        SystemEvent::ShutdownCancelled => {
+            publish(availability_message(cfg, ONLINE));
+            None
+        }
+    }
+}
+
+/// When the 2 s tick may publish states. Between `Suspend` and `Resume` the
+/// tick is off: the OS locks the screen as it goes to sleep, and a
+/// SessionLock must not replace the Suspend state; a connect also ends it, in
+/// case the Resume never comes. After `Shutdown` the tick stays off, also
+/// after a connect, until `ShutdownCancelled`.
+#[derive(Debug, Default)]
+struct Pause {
+    asleep: bool,
+    halting: bool,
+}
+
+impl Pause {
+    fn on_event(&mut self, event: &SystemEvent) {
+        match event {
+            SystemEvent::Suspend { .. } => self.asleep = true,
+            SystemEvent::Resume => self.asleep = false,
+            SystemEvent::Shutdown { .. } => self.halting = true,
+            SystemEvent::ShutdownCancelled => self.halting = false,
+        }
+    }
+
+    fn on_connect(&mut self) {
+        self.asleep = false;
+    }
+
+    fn tick_allowed(&self) -> bool {
+        !self.asleep && !self.halting
     }
 }
 
@@ -161,7 +203,7 @@ impl AckWait {
     }
 }
 
-/// The reply of a `Suspend` that waits for the ack of its `offline`.
+/// The reply of a `Suspend` or `Shutdown` that waits for the ack of its `offline`.
 /// The run loop keeps polling the event loop during the wait.
 #[derive(Default)]
 struct SuspendWait(Option<PendingSuspend>);
@@ -201,7 +243,7 @@ impl SuspendWait {
         if let Some(pending) = &mut self.0
             && pending.ack.on_event(event)
         {
-            info!("offline acknowledged before sleep");
+            info!("offline acknowledged before sleep or shutdown");
             self.finish();
         }
     }
@@ -214,7 +256,7 @@ impl SuspendWait {
     fn expire(&mut self, now: tokio::time::Instant) {
         if self.deadline().is_some_and(|d| now >= d) {
             warn!(
-                "no ack for offline before sleep within {} s",
+                "no ack for offline before sleep or shutdown within {} s",
                 OFFLINE_ACK_TIMEOUT.as_secs()
             );
             self.finish();
@@ -311,24 +353,21 @@ where
     // After a connection error: the time of the next connect attempt.
     let mut retry_at: Option<tokio::time::Instant> = None;
     let mut suspend = SuspendWait::default();
-    // Between Suspend and Resume the tick is off: the OS locks the screen as it
-    // goes to sleep, and a SessionLock must not replace the Suspend state.
-    // A connect also ends it, in case the Resume never comes.
-    let mut asleep = false;
+    let mut pause = Pause::default();
 
     loop {
         tokio::select! {
             _ = &mut stop => break,
             _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)),
                 if retry_at.is_some() => retry_at = None,
-            _ = poll_tick.tick(), if connected && !asleep => {
+            _ = poll_tick.tick(), if connected && pause.tick_allowed() => {
                 let states = core.update(poll(), Instant::now());
                 if connected {
                     session.publish_states(cfg, states);
                 }
             }
             Some(event) = events.recv() => {
-                asleep = matches!(event, SystemEvent::Suspend { .. });
+                pause.on_event(&event);
                 // `true` when the last publish (`offline` of a Suspend) is queued.
                 let mut last_queued = false;
                 let done = handle_event(cfg, &mut core, event, |msg| {
@@ -346,7 +385,7 @@ where
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     info!(host = %cfg.mqtt.host, port = cfg.mqtt.port, "connected to broker");
                     connected = true;
-                    asleep = false;
+                    pause.on_connect();
                     // rumqttc clears its pending queue at a clean-session connect.
                     session.queued = 0;
                     session.sent = 0;
@@ -580,6 +619,90 @@ enabled = false
                 ("homeassistant/sensor/JAHURTX-TEST/availability", "online"),
             ])
         );
+    }
+
+    #[test]
+    fn shutdown_publishes_systemshutdown_then_offline_and_gives_back_the_reply() {
+        let mut core = Core::new(&WITH_EVENTS, None);
+        let (done, mut rx) = oneshot::channel();
+        let (msgs, reply) = messages_of(&mut core, SystemEvent::Shutdown { done });
+        assert_eq!(
+            msgs,
+            pairs(&[
+                (
+                    "homeassistant/sensor/JAHURTX-TEST/lastsystemstatechange/state",
+                    "SystemShutdown"
+                ),
+                ("homeassistant/sensor/JAHURTX-TEST/availability", "offline"),
+            ])
+        );
+        // The run loop completes the reply after the ack wait (SuspendWait).
+        assert!(rx.try_recv().is_err());
+        assert!(reply.is_some());
+    }
+
+    #[test]
+    fn a_cancelled_shutdown_publishes_only_online() {
+        let mut core = Core::new(&WITH_EVENTS, None);
+        let (msgs, reply) = messages_of(&mut core, SystemEvent::ShutdownCancelled);
+        assert!(reply.is_none());
+        assert_eq!(
+            msgs,
+            pairs(&[("homeassistant/sensor/JAHURTX-TEST/availability", "online")])
+        );
+    }
+
+    #[test]
+    fn the_tick_is_off_after_shutdown_also_after_a_connect() {
+        let mut pause = Pause::default();
+        assert!(pause.tick_allowed());
+        let (done, _rx) = oneshot::channel();
+        pause.on_event(&SystemEvent::Shutdown { done });
+        assert!(!pause.tick_allowed());
+        pause.on_connect();
+        assert!(!pause.tick_allowed());
+        pause.on_event(&SystemEvent::ShutdownCancelled);
+        assert!(pause.tick_allowed());
+    }
+
+    #[test]
+    fn the_tick_is_off_between_suspend_and_resume_or_a_connect() {
+        let mut pause = Pause::default();
+        let (done, _rx) = oneshot::channel();
+        pause.on_event(&SystemEvent::Suspend { done });
+        assert!(!pause.tick_allowed());
+        pause.on_event(&SystemEvent::Resume);
+        assert!(pause.tick_allowed());
+        let (done, _rx) = oneshot::channel();
+        pause.on_event(&SystemEvent::Suspend { done });
+        pause.on_connect();
+        assert!(pause.tick_allowed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_done_completes_on_the_ack_after_2_s_or_at_once() {
+        // The Shutdown reply goes through the same wait as the Suspend reply.
+        let mut core = Core::new(&WITH_EVENTS, None);
+        let mut wait = SuspendWait::default();
+
+        let (done, mut rx) = oneshot::channel();
+        let (_, reply) = messages_of(&mut core, SystemEvent::Shutdown { done });
+        wait.start(reply.unwrap(), Some(0), tokio::time::Instant::now());
+        wait.on_event(&outgoing(4));
+        wait.on_event(&puback(4));
+        assert_eq!(rx.try_recv(), Ok(()));
+
+        let (done, mut rx) = oneshot::channel();
+        let (_, reply) = messages_of(&mut core, SystemEvent::Shutdown { done });
+        wait.start(reply.unwrap(), Some(0), tokio::time::Instant::now());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        wait.expire(tokio::time::Instant::now());
+        assert_eq!(rx.try_recv(), Ok(()));
+
+        let (done, mut rx) = oneshot::channel();
+        let (_, reply) = messages_of(&mut core, SystemEvent::Shutdown { done });
+        wait.start(reply.unwrap(), None, tokio::time::Instant::now());
+        assert_eq!(rx.try_recv(), Ok(()));
     }
 
     #[test]

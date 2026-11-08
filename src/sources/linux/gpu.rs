@@ -31,6 +31,17 @@ pub fn sample() -> Option<GpuSample> {
     sample
 }
 
+/// For `diagnose`: one init and one query of GPU 0, as (name, load, power).
+pub fn check() -> Result<(String, u32, Result<f64, String>), String> {
+    let nvml = init()?;
+    let name = nvml
+        .device_by_index(0)
+        .and_then(|d| d.name())
+        .map_err(|e| e.to_string())?;
+    let (load, power) = query(&nvml)?;
+    Ok((name, load, power))
+}
+
 fn init() -> Result<Nvml, String> {
     Nvml::init().map_err(|e| e.to_string())
 }

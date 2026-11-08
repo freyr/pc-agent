@@ -116,6 +116,11 @@ pub fn poll(gpu: bool) -> Snapshot {
     }
 }
 
+/// `pc-agent diagnose`: the checks are for Linux only.
+pub async fn diagnose() {
+    println!("diagnose is for Linux");
+}
+
 /// The receiver of the sleep and wake events. Starts the power thread, so
 /// call it once.
 pub fn events() -> mpsc::Receiver<SystemEvent> {

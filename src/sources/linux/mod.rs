@@ -1,6 +1,7 @@
 //! The Linux sources.
 
 mod boot;
+mod diagnose;
 mod drm;
 mod gpu;
 mod hyprland;
@@ -120,12 +121,19 @@ fn socket_warning(warned: &AtomicBool, answered: bool) -> bool {
     }
 }
 
-/// The receiver of the sleep and wake events. No source sends them yet.
-/// Starts the logind and input tasks, so call it once, inside the tokio runtime.
+/// `pc-agent diagnose`: prints the reads of each source and the result of the
+/// rules, once.
+pub async fn diagnose() {
+    diagnose::run().await;
+}
+
+/// The receiver of the sleep, wake and shutdown events of logind. Starts the
+/// logind and input tasks, so call it once, inside the tokio runtime.
 pub fn events() -> mpsc::Receiver<SystemEvent> {
-    logind::start();
+    let (tx, rx) = mpsc::channel(4);
+    logind::start(tx);
     input::start();
-    mpsc::channel(1).1
+    rx
 }
 
 #[cfg(test)]

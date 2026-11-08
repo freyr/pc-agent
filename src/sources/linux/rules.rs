@@ -11,6 +11,8 @@ use crate::core::{GpuSample, SessionState};
 /// properties that the rules use.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
+    pub id: String,
+    pub seat: String,
     pub uid: u32,
     pub user: String,
     /// `Class`: `user`, `greeter`, `lock-screen`, ...
@@ -43,6 +45,8 @@ pub fn logged_users(sessions: &[Session]) -> Vec<String> {
 /// One monitor object of the Hyprland `j/monitors` reply.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Monitor {
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub disabled: bool,
     #[serde(rename = "dpmsStatus", default)]
@@ -104,6 +108,8 @@ pub fn display_from_monitors(monitors: &[Monitor]) -> bool {
 /// One DRM connector: the trimmed `status` and `dpms` files.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Connector {
+    /// The connector directory name, for example `card1-DP-1`.
+    pub name: String,
     pub status: String,
     pub dpms: String,
 }
@@ -173,6 +179,7 @@ pub struct AxisInfo {
     pub min: i32,
     pub max: i32,
     pub flat: i32,
+    pub fuzz: i32,
 }
 
 /// The capabilities of one input device that the activity test uses.
@@ -224,20 +231,40 @@ pub fn is_activity(caps: &InputCaps, kind: u16, code: u16, value: i32) -> bool {
                 i64::from(a.flat),
             );
             let range = max - min;
-            let stick = STICK_AXES.contains(&code)
-                || HAT_AXES.contains(&code)
-                || (caps.z_is_stick && Z_AXES.contains(&code));
-            if stick {
+            match axis_role(caps, code) {
                 // |v - center| > max(flat, range / 10)
-                10 * (2 * v - (min + max)).abs() > 2 * (10 * flat).max(range)
-            } else if Z_AXES.contains(&code) || PEDAL_AXES.contains(&code) {
+                AxisRole::Stick => 10 * (2 * v - (min + max)).abs() > 2 * (10 * flat).max(range),
                 // v > min + range / 10
-                10 * (v - min) > range
-            } else {
-                false
+                AxisRole::Trigger => 10 * (v - min) > range,
+                AxisRole::Ignored => false,
             }
         }
         _ => false,
+    }
+}
+
+/// The role of an absolute axis of a gamepad in the activity test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AxisRole {
+    /// Counts outside the larger of `flat` and 10 % of the range.
+    Stick,
+    /// Counts above the minimum plus 10 % of the range.
+    Trigger,
+    /// Never counts.
+    Ignored,
+}
+
+/// The role of the axis `code` on the gamepad `caps`.
+pub fn axis_role(caps: &InputCaps, code: u16) -> AxisRole {
+    if STICK_AXES.contains(&code)
+        || HAT_AXES.contains(&code)
+        || (caps.z_is_stick && Z_AXES.contains(&code))
+    {
+        AxisRole::Stick
+    } else if Z_AXES.contains(&code) || PEDAL_AXES.contains(&code) {
+        AxisRole::Trigger
+    } else {
+        AxisRole::Ignored
     }
 }
 
@@ -361,6 +388,8 @@ mod tests {
 
     fn session(user: &str, class: &str, kind: &str, remote: bool, active: bool) -> Session {
         Session {
+            id: "2".to_string(),
+            seat: "seat0".to_string(),
             uid: 1000,
             user: user.to_string(),
             class: class.to_string(),
@@ -508,6 +537,7 @@ mod tests {
 
     fn connector(status: &str, dpms: &str) -> Connector {
         Connector {
+            name: "card1-DP-1".to_string(),
             status: status.to_string(),
             dpms: dpms.to_string(),
         }
@@ -609,7 +639,12 @@ mod tests {
     const REL_X: u16 = 0x00;
 
     fn axis(min: i32, max: i32, flat: i32) -> AxisInfo {
-        AxisInfo { min, max, flat }
+        AxisInfo {
+            min,
+            max,
+            flat,
+            fuzz: 0,
+        }
     }
 
     fn pad(axes: &[(u16, AxisInfo)]) -> InputCaps {

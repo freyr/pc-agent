@@ -31,6 +31,74 @@ pub fn last_input() -> Option<i64> {
     }
 }
 
+/// One input device as `diagnose` shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceInfo {
+    pub path: PathBuf,
+    pub name: String,
+    pub accelerometer: bool,
+    pub caps: InputCaps,
+}
+
+/// For `diagnose`: the `event*` devices of `dir`, sorted by path. Gives an
+/// error when `dir` cannot be read.
+pub fn devices(dir: &Path) -> std::io::Result<Vec<DeviceInfo>> {
+    let mut list = Vec::new();
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        let is_event = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("event"));
+        if !is_event {
+            continue;
+        }
+        match Device::open(&path) {
+            Ok(device) => list.push(DeviceInfo {
+                name: device.name().unwrap_or("").to_string(),
+                accelerometer: device.properties().contains(PropType::ACCELEROMETER),
+                caps: caps(&device),
+                path,
+            }),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", path.display()),
+                ));
+            }
+        }
+    }
+    list.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(list)
+}
+
+/// For `diagnose`: the events that the activity test counts on each device
+/// (not the accelerometers) during `time`, as (path, name, count).
+pub async fn count_rest(devices: &[DeviceInfo], time: Duration) -> Vec<(String, String, usize)> {
+    let tasks = devices
+        .iter()
+        .filter(|d| !d.accelerometer)
+        .map(|d| async move {
+            let mut count = 0;
+            if let Ok(mut stream) = Device::open(&d.path).and_then(Device::into_event_stream) {
+                let _ = tokio::time::timeout(time, async {
+                    while let Ok(event) = stream.next_event().await {
+                        if rules::is_activity(
+                            &d.caps,
+                            event.event_type().0,
+                            event.code(),
+                            event.value(),
+                        ) {
+                            count += 1;
+                        }
+                    }
+                })
+                .await;
+            }
+            (d.path.display().to_string(), d.name.clone(), count)
+        });
+    futures_util::future::join_all(tasks).await
+}
+
 /// Starts the input task. Call it once, inside the tokio runtime.
 pub fn start() {
     tokio::spawn(run(PathBuf::from(INPUT_DIR)));
@@ -96,6 +164,7 @@ fn caps(device: &Device) -> InputCaps {
                         min: info.minimum(),
                         max: info.maximum(),
                         flat: info.flat(),
+                        fuzz: info.fuzz(),
                     },
                 )
             })

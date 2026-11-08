@@ -20,9 +20,9 @@ const LIMIT: Duration = Duration::from_secs(1);
 /// `true` while a socket search runs on its helper thread.
 static BUSY: AtomicBool = AtomicBool::new(false);
 
-/// The request sockets of the Hyprland instances of `uid`, the newest
-/// instance directory first.
-fn sockets(run_user: &Path, uid: u32) -> Vec<PathBuf> {
+/// The Hyprland instance directories of `uid` with their mtime, the newest
+/// first.
+pub fn instance_dirs(run_user: &Path, uid: u32) -> Vec<(SystemTime, PathBuf)> {
     let dir = run_user.join(uid.to_string()).join("hypr");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -35,11 +35,28 @@ fn sockets(run_user: &Path, uid: u32) -> Vec<PathBuf> {
                 return None;
             }
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            Some((mtime, e.path().join(".socket.sock")))
+            Some((mtime, e.path()))
         })
         .collect();
     list.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    list.into_iter().map(|(_, path)| path).collect()
+    list
+}
+
+/// The request sockets of the Hyprland instances of `uid`, the newest
+/// instance directory first.
+fn sockets(run_user: &Path, uid: u32) -> Vec<PathBuf> {
+    instance_dirs(run_user, uid)
+        .into_iter()
+        .map(|(_, dir)| dir.join(".socket.sock"))
+        .collect()
+}
+
+/// The `j/monitors` list of one socket, or `None` when it does not answer
+/// with a monitor list.
+pub fn probe(socket: &Path) -> Option<Vec<Monitor>> {
+    request(socket, "j/monitors")
+        .ok()
+        .and_then(|reply| rules::parse_monitors(&reply))
 }
 
 /// Sends `command` and reads the reply to EOF.
@@ -88,11 +105,9 @@ fn monitors_limited(
 }
 
 fn search(run_user: &Path, uid: u32) -> Option<Vec<Monitor>> {
-    sockets(run_user, uid).iter().find_map(|socket| {
-        request(socket, "j/monitors")
-            .ok()
-            .and_then(|reply| rules::parse_monitors(&reply))
-    })
+    sockets(run_user, uid)
+        .iter()
+        .find_map(|socket| probe(socket))
 }
 
 #[cfg(test)]
