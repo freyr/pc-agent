@@ -17,9 +17,9 @@ use ::windows::core::HSTRING;
 use tokio::io::AsyncReadExt;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
-use super::super::helper_rules::{HelperMessage, LineFramer};
+use super::super::helper_rules::{self, CREATE_RETRY, HelperMessage, LineFramer};
 
 /// What the pipe server reports, with the session of the helper.
 #[derive(Debug, PartialEq)]
@@ -38,23 +38,25 @@ pub fn process_session(pid: u32) -> Option<u32> {
         .map(|()| session)
 }
 
-/// Serves the pipe `name` with the DACL `sddl` until an instance cannot be
-/// created. `check` gives the session of an accepted client process, or
-/// `None` to refuse it. Each accepted client is read on its own task.
+/// Serves the pipe `name` with the DACL `sddl`; it never returns. `check`
+/// gives the session of an accepted client process, or `None` to refuse it.
+/// Each accepted client is read on its own task. A failed instance create
+/// is tried again each 5 s.
 pub async fn serve(
     name: &str,
     sddl: &str,
     check: impl Fn(u32) -> Option<u32>,
     events: UnboundedSender<PipeEvent>,
-) -> io::Result<()> {
+) {
     // The first instance fails when a pipe of this name exists already, so
-    // no other process holds the name before the service.
-    let mut server = create(name, sddl, true)?;
+    // the service never joins a pipe that another process created.
+    let mut server = create_retry(name, sddl, true).await;
     loop {
         let connected = server.connect().await;
         // A listening instance exists at all times: the next one is made
         // before the connected one leaves `server`.
-        let client = std::mem::replace(&mut server, create(name, sddl, false)?);
+        let next = create_retry(name, sddl, false).await;
+        let client = std::mem::replace(&mut server, next);
         if let Err(e) = connected {
             debug!(error = %e, "pipe connect failed");
             continue;
@@ -70,6 +72,32 @@ pub async fn serve(
             ),
         }
     }
+}
+
+/// `create` until it works. The first error of a run of failures is logged
+/// as an error: for the first instance it can mean that another process
+/// holds the name.
+async fn create_retry(name: &str, sddl: &str, first: bool) -> NamedPipeServer {
+    let mut failed = false;
+    let server = helper_rules::retry(
+        || create(name, sddl, first),
+        |e, attempt| {
+            failed = true;
+            if attempt == 1 {
+                error!(
+                    first,
+                    "cannot create the pipe {name}: {e}; trying again each {CREATE_RETRY:?}"
+                );
+            } else {
+                debug!(first, attempt, "cannot create the pipe {name}: {e}");
+            }
+        },
+    )
+    .await;
+    if failed {
+        info!(first, "created the pipe {name}");
+    }
+    server
 }
 
 /// The process ID of the client of a connected instance.
@@ -193,6 +221,8 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let server_name = name.clone();
         let server = tokio::spawn(async move { serve(&server_name, &sddl, check, tx).await });
+        // The create errors of the server are logged: show them in the output.
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         // Let the server create its first instance.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -217,18 +247,24 @@ mod tests {
                     }
                     PipeEvent::Message(s, HelperMessage::LastInput(t)) => {
                         assert!(connected);
-                        return (s, t);
+                        return Some((s, t));
                     }
                     PipeEvent::Disconnected(_) => panic!("the helper disconnected"),
                 }
             }
-            panic!("the server stopped");
+            None
         })
         .await;
         let _ = helper.kill();
         let _ = helper.wait();
+        let got = match got {
+            Ok(Some(got)) => got,
+            // The channel ended: the server task is gone; show why.
+            Ok(None) => panic!("the server stopped: {:?}", server.await),
+            Err(_) => panic!("no last_input within 20 s (see the pipe errors above)"),
+        };
         server.abort();
-        let (session, t) = got.expect("no last_input within 20 s");
+        let (session, t) = got;
         assert_eq!(session, own_session);
         // The last input of this session: not in the future, after 2023.
         assert!(t <= now + 1 && t > 1_700_000_000, "{t}");

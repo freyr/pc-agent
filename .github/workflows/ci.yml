@@ -273,6 +273,47 @@ jobs:
             ForEach-Object { "process $($_.ProcessId) session $($_.SessionId): $($_.CommandLine)" }
           $global:LASTEXITCODE = 0
 
+      - name: Restart the service and check that the old helper exits
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $bin = 'homeassistant/binary_sensor/CI-TEST'
+          function Get-Helpers {
+            @(Get-CimInstance Win32_Process -Filter "Name = 'pc-agent.exe'" |
+              Where-Object { $_.CommandLine -match 'session-helper' })
+          }
+          $old = Get-Helpers
+          $old | ForEach-Object { "old helper $($_.ProcessId) session $($_.SessionId)" }
+          if ($old.Count -eq 0) { throw "no helper runs before the restart" }
+          sc.exe stop pc-agent | Out-Null
+          $stopped = $false
+          foreach ($i in 1..20) {
+            if ((sc.exe query pc-agent) -match 'STOPPED') { $stopped = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $stopped) { throw "pc-agent did not stop" }
+          # The helper checks its pipe each 1 s: it must exit without input.
+          $left = $old
+          foreach ($i in 1..10) {
+            $left = @($old | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
+            if ($left.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($left.Count -ne 0) { throw "the old helper still runs 5 s after the stop: $($left.ProcessId)" }
+          # Remove the retained ON, so only the new service can set it again.
+          mosquitto_pub -h 127.0.0.1 -r -n -t "$bin/inputhelper/state"
+          if ($LASTEXITCODE -ne 0) { throw "cannot clear the retained inputhelper state" }
+          sc.exe start pc-agent | Out-Null
+          $state = ''
+          foreach ($i in 1..15) {
+            $state = & $env:MQTT_READ "$bin/inputhelper/state" 5
+            if ($state -eq 'ON') { break }
+            Start-Sleep -Seconds 2
+          }
+          "inputhelper after the restart: $state"
+          if ($state -ne 'ON') { throw "inputhelper is '$state' after the restart, expected ON" }
+          Get-Helpers | ForEach-Object { "new helper $($_.ProcessId) session $($_.SessionId)" }
+          $global:LASTEXITCODE = 0
+
       - name: Uninstall the service
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
@@ -292,9 +333,15 @@ jobs:
           }
           if (-not $gone) { throw "the service pc-agent still exists" }
           if (-not (Test-Path C:\ProgramData\pc-agent\config.toml)) { throw "uninstall removed the configuration" }
-          # The helper exits at its next write to the closed pipe, after the
-          # next input; the runner gets no input, so end it here.
-          Get-Process pc-agent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          # The helper exits within 1 s after its pipe closes.
+          $left = @()
+          foreach ($i in 1..10) {
+            $left = @(Get-CimInstance Win32_Process -Filter "Name = 'pc-agent.exe'" |
+              Where-Object { $_.CommandLine -match 'session-helper' })
+            if ($left.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($left.Count -ne 0) { throw "a session helper still runs after the uninstall: $($left.ProcessId)" }
           $global:LASTEXITCODE = 0
 
       # After the uninstall, so diagnose cannot disturb the service checks;

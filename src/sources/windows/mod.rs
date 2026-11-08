@@ -20,7 +20,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use ::windows::Win32::System::SystemInformation::GetTickCount64;
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use super::helper_rules::{self, HelperMessage, InputState};
 use super::wts_rules::DisplayCell;
@@ -143,10 +142,7 @@ fn start_helpers() {
     };
     tokio::spawn(async move {
         let sddl = helper_rules::pipe_sddl(None);
-        let served = pipe::serve(helper_rules::PIPE_NAME, &sddl, check, tx).await;
-        if let Err(e) = served {
-            warn!("no session helper pipe: {e}");
-        }
+        pipe::serve(helper_rules::PIPE_NAME, &sddl, check, tx).await;
     });
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {

@@ -7,7 +7,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,7 +20,7 @@ use ::windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use ::windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
-use ::windows::Win32::System::Pipes::CreatePipe;
+use ::windows::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use ::windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use ::windows::Win32::System::SystemInformation::GetTickCount;
 use ::windows::Win32::System::Threading::{
@@ -108,6 +108,8 @@ pub fn probe() -> ExitCode {
 /// `pc-agent session-helper [--pipe <name>]`: sends the input time of this
 /// session to the pipe (`\\.\pipe\pc-agent` by default) until the service
 /// closes it. The first value goes at once, then a change at most each 2 s.
+/// Each 1 s it checks the pipe, so it exits within 1 s after the service
+/// stops, also with no input.
 pub fn run(pipe: Option<&str>) -> ExitCode {
     let mut out = match open_pipe(pipe.unwrap_or(PIPE_NAME)) {
         Ok(file) => file,
@@ -120,6 +122,10 @@ pub fn run(pipe: Option<&str>) -> ExitCode {
     let mut gamepad = None;
     let mut rule = SendRule::default();
     loop {
+        if !pipe_open(&out) {
+            // The service closed the pipe: it stopped or restarts.
+            return ExitCode::SUCCESS;
+        }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
@@ -144,6 +150,15 @@ pub fn run(pipe: Option<&str>) -> ExitCode {
         }
         std::thread::sleep(READ_INTERVAL);
     }
+}
+
+/// `false` when the server end of the pipe is closed. `PeekNamedPipe` does
+/// not block (a reader thread would: a blocked `ReadFile` on a synchronous
+/// handle also blocks the writes); it needs the `FILE_READ_DATA` of
+/// `HELPER_ACCESS`.
+fn pipe_open(pipe: &File) -> bool {
+    // SAFETY: the handle of `pipe` is valid while `pipe` lives; no buffer is passed.
+    unsafe { PeekNamedPipe(HANDLE(pipe.as_raw_handle()), None, 0, None, None, None) }.is_ok()
 }
 
 /// Opens the client end of the pipe `name` for writing. It asks only for

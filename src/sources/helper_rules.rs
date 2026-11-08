@@ -38,15 +38,15 @@ pub const PIPE_CLIENT_RIGHTS: u32 =
 /// `PIPE_CLIENT_RIGHTS` (`GENERIC_WRITE` would ask for the create right too).
 pub const HELPER_ACCESS: u32 = FILE_GENERIC_READ | FILE_WRITE_DATA;
 
-/// The DACL of the pipe: SYSTEM full access, the `INTERACTIVE` group read and write.
-pub const PIPE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;0x12019b;;;IU)";
-
-/// The pipe DACL; `extra_sid` (the CI test only) gets the rights of
-/// `INTERACTIVE` too.
+/// The DACL of the pipe: SYSTEM full access, the `INTERACTIVE` group read
+/// and write (`PIPE_CLIENT_RIGHTS`). `extra_sid` (the CI test only) gets the
+/// rights of SYSTEM too: the test server runs as that user and must create
+/// the next pipe instance. The helper still opens the pipe with `HELPER_ACCESS`.
 pub fn pipe_sddl(extra_sid: Option<&str>) -> String {
+    let sddl = format!("D:P(A;;FA;;;SY)(A;;{PIPE_CLIENT_RIGHTS:#x};;;IU)");
     match extra_sid {
-        None => PIPE_SDDL.to_string(),
-        Some(sid) => format!("{PIPE_SDDL}(A;;{PIPE_CLIENT_RIGHTS:#x};;;{sid})"),
+        None => sddl,
+        Some(sid) => format!("{sddl}(A;;FA;;;{sid})"),
     }
 }
 
@@ -130,6 +130,28 @@ pub fn clamp_input(t: i64, last: Option<i64>, now: i64) -> i64 {
     let t = t.min(now);
     // The last value wins over `now`: the input time never goes back.
     last.map_or(t, |last| t.max(last))
+}
+
+/// The interval of the tries to create a pipe instance after a failure.
+pub const CREATE_RETRY: Duration = Duration::from_secs(5);
+
+/// Calls `make` until it works, with `CREATE_RETRY` between the tries.
+/// `on_error` gets each error and its try number (1 for the first).
+pub async fn retry<T, E>(
+    mut make: impl FnMut() -> Result<T, E>,
+    mut on_error: impl FnMut(&E, u32),
+) -> T {
+    let mut attempt = 0;
+    loop {
+        match make() {
+            Ok(value) => return value,
+            Err(e) => {
+                attempt += 1;
+                on_error(&e, attempt);
+            }
+        }
+        tokio::time::sleep(CREATE_RETRY).await;
+    }
 }
 
 /// The restart delays of a helper: 5 s, 30 s, then 5 min.
@@ -637,11 +659,11 @@ mod tests {
     #[test]
     fn the_production_pipe_dacl_is_system_full_and_interactive_read_and_write() {
         assert_eq!(PIPE_NAME, r"\\.\pipe\pc-agent");
-        assert_eq!(pipe_sddl(None), PIPE_SDDL);
-        assert_eq!(PIPE_SDDL, "D:P(A;;FA;;;SY)(A;;0x12019b;;;IU)");
+        let sddl = pipe_sddl(None);
+        assert_eq!(sddl, "D:P(A;;FA;;;SY)(A;;0x12019b;;;IU)");
         // Protected, two allow ACEs: SY (LocalSystem) file-all, IU (INTERACTIVE)
         // the read and write mask.
-        let aces: Vec<&str> = PIPE_SDDL
+        let aces: Vec<&str> = sddl
             .strip_prefix("D:P")
             .unwrap()
             .trim_matches(|c| c == '(' || c == ')')
@@ -662,11 +684,45 @@ mod tests {
     }
 
     #[test]
-    fn the_test_pipe_dacl_adds_the_user_sid_with_the_same_rights() {
+    fn the_test_pipe_dacl_gives_the_user_sid_the_rights_of_system() {
+        // The test server runs as that user instead of SYSTEM: it needs the
+        // right to create the next pipe instance.
         assert_eq!(
             pipe_sddl(Some("S-1-5-21-1-2-3-500")),
-            "D:P(A;;FA;;;SY)(A;;0x12019b;;;IU)(A;;0x12019b;;;S-1-5-21-1-2-3-500)"
+            "D:P(A;;FA;;;SY)(A;;0x12019b;;;IU)(A;;FA;;;S-1-5-21-1-2-3-500)"
         );
+    }
+
+    // Retry of a failed pipe instance create.
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_create_is_tried_again_each_5_s_until_it_works() {
+        let start = tokio::time::Instant::now();
+        let mut calls = 0;
+        let mut errors = Vec::new();
+        let value = retry(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(format!("e{calls}"))
+                } else {
+                    Ok(calls)
+                }
+            },
+            |e, attempt| errors.push((e.clone(), attempt)),
+        )
+        .await;
+        assert_eq!(value, 3);
+        assert_eq!(errors, [("e1".to_string(), 1), ("e2".to_string(), 2)]);
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_create_that_works_at_once_does_not_wait() {
+        let start = tokio::time::Instant::now();
+        let value = retry(|| Ok::<_, String>(7), |_, _| panic!("no error expected")).await;
+        assert_eq!(value, 7);
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     // XInput change rule.
