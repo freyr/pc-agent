@@ -83,7 +83,7 @@ jobs:
         run: |
           # Chocolatey has no mosquitto package: use the official installer (NSIS, silent).
           $setup = Join-Path $env:RUNNER_TEMP "mosquitto-setup.exe"
-          Invoke-WebRequest -Uri "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe" -OutFile $setup
+          Invoke-WebRequest -Uri "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe" -OutFile $setup -MaximumRetryCount 5 -RetryIntervalSec 10
           $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "the mosquitto installer failed with $($p.ExitCode)" }
           # The runner ends background processes at the end of a step, so the
