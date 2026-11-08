@@ -1,0 +1,10 @@
+{
+  "version": "0.2.0",
+  "commit": "4cf806aab3b9e17c29f7ea12c20f512b2557e5b6",
+  "built_at": "2026-11-08T16:52:57Z",
+  "platforms": {
+    "x86_64-linux": { "asset": "pc-agent-x86_64-linux", "sha256": "d745fba1cb70ab9dc02a80eeba8a1864a0f32b2941e008c0af389be7b56ba830" },
+    "aarch64-macos": { "asset": "pc-agent-aarch64-macos", "sha256": "c71c299bfec3780fc85b43aca79beffdaaf834c7590eb06403dbbcbe3a0f769b" },
+    "x86_64-windows": { "asset": "pc-agent-x86_64-windows.exe", "sha256": "5d1a3327d257b41322d76e3718177c35f503ee84b4a89ff5746b38d00e9f0649" }
+  }
+}

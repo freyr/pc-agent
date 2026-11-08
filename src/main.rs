@@ -6,6 +6,7 @@ mod logfile;
 mod mqtt;
 mod sources;
 mod time;
+mod update;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -87,6 +88,13 @@ enum Command {
     SessionHelper {
         pipe: Option<String>,
     },
+    /// `update --verify <manifest> <signature> <public key file>` (not in
+    /// the help): checks a signed release manifest, for CI.
+    UpdateVerify {
+        manifest: PathBuf,
+        signature: PathBuf,
+        public_key: PathBuf,
+    },
     Help,
 }
 
@@ -137,6 +145,31 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
                 }
                 return Ok(Command::Uninstall);
             }
+            "update" => {
+                let command = match (
+                    args.next().as_deref(),
+                    args.next(),
+                    args.next(),
+                    args.next(),
+                ) {
+                    (Some("--verify"), Some(manifest), Some(signature), Some(public_key)) => {
+                        Command::UpdateVerify {
+                            manifest: PathBuf::from(manifest),
+                            signature: PathBuf::from(signature),
+                            public_key: PathBuf::from(public_key),
+                        }
+                    }
+                    (Some("--verify"), ..) => {
+                        bail!("--verify needs <manifest> <signature> <public key file>")
+                    }
+                    (Some(other), ..) => bail!("unknown argument {other:?} after update"),
+                    (None, ..) => bail!("update needs --verify"),
+                };
+                if let Some(other) = args.next() {
+                    bail!("unknown argument {other:?} after update");
+                }
+                return Ok(command);
+            }
             "--config" => match args.next() {
                 Some(path) => config = PathBuf::from(path),
                 None => bail!("--config needs a path"),
@@ -169,6 +202,11 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(Command::Diagnose { config }) => return diagnose(config),
+        Ok(Command::UpdateVerify {
+            manifest,
+            signature,
+            public_key,
+        }) => return update::verify_files(&manifest, &signature, &public_key),
         #[cfg(windows)]
         Ok(Command::SessionHelperProbe) => return sources::probe(),
         #[cfg(windows)]
@@ -412,6 +450,29 @@ mod tests {
     fn install_is_for_windows_only() {
         assert!(parse_args(args(&["install"])).is_err());
         assert!(parse_args(args(&["uninstall"])).is_err());
+    }
+
+    #[test]
+    fn update_verify_command() {
+        assert_eq!(
+            parse_args(args(&[
+                "update",
+                "--verify",
+                "m.json",
+                "m.json.minisig",
+                "k.pub"
+            ]))
+            .unwrap(),
+            Command::UpdateVerify {
+                manifest: PathBuf::from("m.json"),
+                signature: PathBuf::from("m.json.minisig"),
+                public_key: PathBuf::from("k.pub"),
+            }
+        );
+        assert!(parse_args(args(&["update"])).is_err());
+        assert!(parse_args(args(&["update", "--verify", "m.json", "m.json.minisig"])).is_err());
+        assert!(parse_args(args(&["update", "--verify", "m", "s", "k", "x"])).is_err());
+        assert!(parse_args(args(&["update", "--bogus", "m", "s", "k"])).is_err());
     }
 
     #[test]

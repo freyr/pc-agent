@@ -21,6 +21,11 @@ jobs:
       - run: cargo test
       - run: cargo build --release
       - run: bash scripts/package.sh dist
+      - name: Sign a test manifest and verify it
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+          bash scripts/check-manifest.sh dist
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-x86_64-linux
@@ -41,6 +46,10 @@ jobs:
       - run: cargo test
       - run: cargo build --release
       - run: bash scripts/package.sh dist
+      - name: Sign a test manifest and verify it
+        run: |
+          brew install minisign
+          bash scripts/check-manifest.sh dist
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-aarch64-macos
@@ -82,6 +91,23 @@ jobs:
         env:
           PC_AGENT_EXE: target\release\pc-agent.exe
         run: cargo test -- --ignored --nocapture the_helper_sends_last_input_over_a_test_pipe
+      # The runner has no minisign package (signing happens only on Linux in
+      # release.yml), so this job verifies the committed fixture that a
+      # throwaway key signed; the Linux and macOS jobs sign in the job.
+      - name: Verify the signed test manifest with the exe
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $exe = '.\target\release\pc-agent.exe'
+          $data = 'src\update\testdata'
+          & $exe update --verify "$data\manifest.json" "$data\manifest.json.minisig" "$data\test.pub"
+          if ($LASTEXITCODE -ne 0) { throw "the signed manifest did not verify" }
+          $changed = Join-Path $env:RUNNER_TEMP 'changed.json'
+          $text = [IO.File]::ReadAllText("$PWD\$data\manifest.json")
+          $text = $text.Replace('"version": "', '"version": "9')
+          [IO.File]::WriteAllText($changed, $text)
+          & $exe update --verify $changed "$data\manifest.json.minisig" "$data\test.pub"
+          if ($LASTEXITCODE -eq 0) { throw "a changed manifest verified" }
+          $global:LASTEXITCODE = 0
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-x86_64-windows
