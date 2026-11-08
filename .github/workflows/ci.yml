@@ -154,8 +154,28 @@ jobs:
           [gpu]
           enabled = true
           "@ | Set-Content -Path $cfg -Encoding utf8
-          .\target\release\pc-agent.exe install --config $cfg
-          if ($LASTEXITCODE -ne 0) { throw "pc-agent install failed" }
+          # The runner has Fast Startup off, so turn it on for the install to
+          # prove that the registry read and the warning work, then restore.
+          $values = @(
+            @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; Name = 'HiberbootEnabled' },
+            @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'; Name = 'HibernateEnabled' }
+          )
+          foreach ($v in $values) {
+            $v.Old = (Get-ItemProperty $v.Key -Name $v.Name -ErrorAction SilentlyContinue).($v.Name)
+            "$($v.Name) before: '$($v.Old)'"
+            Set-ItemProperty -Path $v.Key -Name $v.Name -Value 1 -Type DWord
+          }
+          try {
+            $out = .\target\release\pc-agent.exe install --config $cfg
+            if ($LASTEXITCODE -ne 0) { throw "pc-agent install failed" }
+            $out
+          } finally {
+            foreach ($v in $values) {
+              if ($null -eq $v.Old) { Remove-ItemProperty -Path $v.Key -Name $v.Name -ErrorAction SilentlyContinue }
+              else { Set-ItemProperty -Path $v.Key -Name $v.Name -Value $v.Old -Type DWord }
+            }
+          }
+          if (-not ($out | Select-String -SimpleMatch 'Fast Startup is on')) { throw "no Fast Startup warning with Fast Startup on" }
           sc.exe qc pc-agent
           sc.exe qfailure pc-agent
 
@@ -185,6 +205,9 @@ jobs:
           $config = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/lastboot/config' 20
           "lastboot config: $config"
           if (($config | ConvertFrom-Json).name -ne 'lastboot') { throw "bad lastboot config" }
+          $event = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/lastsystemstatechange/state' 20
+          "lastsystemstatechange: $event"
+          if ($event -ne 'ApplicationStarted') { throw "expected ApplicationStarted, got '$event'" }
 
       - name: Read the session states and check that no GPU is published
         run: |

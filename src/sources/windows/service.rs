@@ -1,9 +1,11 @@
 //! The service frame: the dispatcher, the control handler and the service
-//! status. The handler forwards each control to the runtime through a
-//! channel and returns at once. `Stop` and `Preshutdown` stop the agent: it
-//! publishes the retained `offline` and disconnects. The handler records
-//! each console display notification for the poll. The session and power
-//! controls reach the runtime too; the later tasks handle them.
+//! status. The handler forwards each control to the runtime and returns at
+//! once, with one exception: for `PBT_APMSUSPEND` it sends `Suspend` and
+//! blocks until the reply, at most the ack wait, because Windows goes on into
+//! sleep when the handler returns. `Stop` stops the agent: it publishes the
+//! retained `offline` and disconnects. `Preshutdown` first sends `Shutdown`
+//! and waits for the reply. The handler records each console display
+//! notification for the poll.
 
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
@@ -17,8 +19,8 @@ use ::windows::Win32::System::Power::RegisterPowerSettingNotification;
 use ::windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use ::windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_SERVICE_HANDLE;
 use anyhow::Result;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tracing::{debug, error, info, warn};
+use tokio::sync::mpsc::{self, UnboundedReceiver, unbounded_channel};
+use tracing::{error, info, warn};
 use windows_service::service::{
     PowerBroadcastSetting, PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode,
     ServiceState, ServiceStatus, ServiceType,
@@ -26,8 +28,11 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use super::{DATA_DIR, DISPLAY, SERVICE_NAME};
+use super::{DATA_DIR, DISPLAY, EVENTS, SERVICE_NAME};
+use crate::core::SystemEvent;
 use crate::logfile::LogFile;
+use crate::sources::ACK_WAIT;
+use crate::sources::wts_rules::{self, ControlAction};
 
 /// The size limit of the log file; one old file is kept.
 const LOG_LIMIT: u64 = 1024 * 1024;
@@ -38,7 +43,7 @@ const ACCEPTED: ServiceControlAccept = ServiceControlAccept::STOP
     .union(ServiceControlAccept::SESSION_CHANGE)
     .union(ServiceControlAccept::POWER_EVENT);
 
-/// The time that the stop may take: the 2 s ack wait of `offline`, the
+/// The time that the stop may take: the ack wait of `offline`, the
 /// disconnect and some margin.
 const STOP_WAIT_HINT: Duration = Duration::from_secs(5);
 
@@ -103,25 +108,82 @@ fn status(state: ServiceState, accepted: ServiceControlAccept, exit: u32) -> Ser
     }
 }
 
+/// The raw codes of a control for `wts_rules::control_action`: the
+/// `SERVICE_CONTROL_*` code and the `WTS_*` reason or the `PBT_*` event.
+fn raw_codes(control: &ServiceControl) -> (u32, u32) {
+    use ::windows::Win32::UI::WindowsAndMessaging as wm;
+    let event_type = match control {
+        ServiceControl::SessionChange(param) => param.reason.to_raw(),
+        ServiceControl::PowerEvent(event) => match event {
+            PowerEventParam::PowerStatusChange => wm::PBT_APMPOWERSTATUSCHANGE,
+            PowerEventParam::ResumeAutomatic => wm::PBT_APMRESUMEAUTOMATIC,
+            PowerEventParam::ResumeSuspend => wm::PBT_APMRESUMESUSPEND,
+            PowerEventParam::Suspend => wm::PBT_APMSUSPEND,
+            PowerEventParam::PowerSettingChange(_) => wm::PBT_POWERSETTINGCHANGE,
+            PowerEventParam::BatteryLow => wm::PBT_APMBATTERYLOW,
+            PowerEventParam::OemEvent => wm::PBT_APMOEMEVENT,
+            PowerEventParam::QuerySuspend => wm::PBT_APMQUERYSUSPEND,
+            PowerEventParam::QuerySuspendFailed => wm::PBT_APMQUERYSUSPENDFAILED,
+            PowerEventParam::ResumeCritical => wm::PBT_APMRESUMECRITICAL,
+            // A variant of a later windows-service: no PBT event that the rules act on.
+            _ => u32::MAX,
+        },
+        _ => 0,
+    };
+    (control.raw_service_control_type(), event_type)
+}
+
+/// Sends an event of a control to the runtime without a wait.
+fn forward(events: &mpsc::Sender<SystemEvent>, event: SystemEvent) {
+    if let Err(e) = events.try_send(event) {
+        warn!(error = %e, "cannot forward a control event");
+    }
+}
+
 fn run_service() -> Result<()> {
     let (tx, rx) = unbounded_channel();
-    let handler = move |control| match control {
-        ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-        ServiceControl::Stop
-        | ServiceControl::Preshutdown
-        | ServiceControl::SessionChange(_)
-        | ServiceControl::PowerEvent(_) => {
-            if let ServiceControl::PowerEvent(PowerEventParam::PowerSettingChange(
-                PowerBroadcastSetting::ConsoleDisplayState(state),
-            )) = &control
-            {
-                DISPLAY.record(state.to_raw());
-            }
-            // The runtime is gone after the stop: nothing to forward to then.
-            let _ = tx.send(control);
-            ServiceControlHandlerResult::NoError
+    let (events_tx, events_rx) = mpsc::channel(8);
+    if let Ok(mut slot) = EVENTS.lock() {
+        *slot = Some(events_rx);
+    }
+    // The handler runs on a thread of the service control manager, outside
+    // the runtime of the agent: this runtime gives the timer of the suspend wait.
+    let waiter = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let handler_events = events_tx.clone();
+    let handler = move |control: ServiceControl| {
+        if let ServiceControl::PowerEvent(PowerEventParam::PowerSettingChange(
+            PowerBroadcastSetting::ConsoleDisplayState(state),
+        )) = &control
+        {
+            DISPLAY.record(state.to_raw());
         }
-        _ => ServiceControlHandlerResult::NotImplemented,
+        let (raw, event_type) = raw_codes(&control);
+        match wts_rules::control_action(raw, event_type) {
+            // The runtime is gone after the stop: nothing to forward to then.
+            ControlAction::Stop | ControlAction::ShutdownThenStop => {
+                let _ = tx.send(control);
+            }
+            ControlAction::Suspend => {
+                info!("system will sleep");
+                waiter.block_on(wts_rules::suspend(&handler_events, ACK_WAIT));
+            }
+            ControlAction::Resume => {
+                info!("system resumed");
+                forward(&handler_events, SystemEvent::Resume);
+            }
+            ControlAction::SessionChange => forward(&handler_events, SystemEvent::SessionChange),
+            ControlAction::Ignore => {}
+        }
+        match control {
+            ServiceControl::Interrogate
+            | ServiceControl::Stop
+            | ServiceControl::Preshutdown
+            | ServiceControl::SessionChange(_)
+            | ServiceControl::PowerEvent(_) => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
     };
     let handle = service_control_handler::register(SERVICE_NAME, handler)?;
     handle.set_service_status(status(ServiceState::Running, ACCEPTED, 0))?;
@@ -146,13 +208,19 @@ fn run_service() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(crate::config::DEFAULT_PATH));
     let result = crate::run(config, || {
         Ok(async move {
-            stop_control(rx).await;
+            let preshutdown = stop_control(rx).await;
+            // windows-service frees the handler closure after Stop and
+            // Preshutdown, so accept no control from here on, before the
+            // shutdown wait below.
             if let Err(e) = handle.set_service_status(status(
                 ServiceState::StopPending,
                 ServiceControlAccept::empty(),
                 0,
             )) {
                 warn!(error = %e, "cannot report StopPending");
+            }
+            if preshutdown {
+                wts_rules::shutdown(&events_tx).await;
             }
         })
     });
@@ -165,20 +233,17 @@ fn run_service() -> Result<()> {
     result
 }
 
-/// Completes at the first `Stop` or `Preshutdown`.
-async fn stop_control(mut controls: UnboundedReceiver<ServiceControl>) {
-    while let Some(control) = controls.recv().await {
-        match control {
-            ServiceControl::Stop => {
-                info!("service stop received");
-                return;
-            }
-            ServiceControl::Preshutdown => {
-                info!("preshutdown received");
-                return;
-            }
-            // W2 and W3 turn the session and power controls into events.
-            other => debug!(control = ?other, "control not handled yet"),
+/// Completes at the first `Stop` or `Preshutdown`; true for `Preshutdown`.
+async fn stop_control(mut controls: UnboundedReceiver<ServiceControl>) -> bool {
+    // The handler sends only Stop and Preshutdown here.
+    match controls.recv().await {
+        Some(ServiceControl::Preshutdown) => {
+            info!("preshutdown received");
+            true
+        }
+        _ => {
+            info!("service stop received");
+            false
         }
     }
 }

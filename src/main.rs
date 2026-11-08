@@ -224,7 +224,8 @@ where
     runtime.block_on(async {
         let stop = stop()?;
         let poll = move || sources::poll(gpu);
-        mqtt::run(&cfg, &model, core, poll, sources::events(), stop).await
+        let events = sources::events();
+        mqtt::run(&cfg, &model, core, poll, events, sources::ACK_WAIT, stop).await
     })
 }
 

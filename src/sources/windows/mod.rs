@@ -1,11 +1,13 @@
 //! The Windows sources and the service frame. The service reads the boot
 //! time, the console session, the session list, the display state and the
-//! GPU; the later tasks add the power events and the helper sources.
+//! GPU, and turns the session and power controls into events; the later
+//! tasks add the helper sources.
 
 mod install;
 mod service;
 mod wts;
 
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::windows::Win32::System::SystemInformation::GetTickCount64;
@@ -25,26 +27,32 @@ const DATA_DIR: &str = r"C:\ProgramData\pc-agent";
 const SERVICE_NAME: &str = "pc-agent";
 
 /// The entities that the Windows sources supply with the GPU on.
-static SUPPLIED: [&Entity; 6] = [
+static SUPPLIED: [&Entity; 7] = [
     &entities::LASTBOOT,
     &entities::SESSIONSTATE,
     &entities::LOGGEDUSERS,
     &entities::DISPLAY,
     &entities::GPULOAD,
     &entities::GPUPOWER,
+    &entities::LASTSYSTEMSTATECHANGE,
 ];
 
 /// The entities with the GPU off (`[gpu] enabled = false`).
-static SUPPLIED_NO_GPU: [&Entity; 4] = [
+static SUPPLIED_NO_GPU: [&Entity; 5] = [
     &entities::LASTBOOT,
     &entities::SESSIONSTATE,
     &entities::LOGGEDUSERS,
     &entities::DISPLAY,
+    &entities::LASTSYSTEMSTATECHANGE,
 ];
 
 /// The last console display state: the service control handler records each
 /// `GUID_CONSOLE_DISPLAY_STATE` notification, the poll reads it.
 static DISPLAY: DisplayCell = DisplayCell::new();
+
+/// The receiver of the events of the service controls. The service puts it
+/// here before the agent runs; `events()` takes it.
+static EVENTS: Mutex<Option<mpsc::Receiver<SystemEvent>>> = Mutex::new(None);
 
 pub fn supplied(gpu: bool) -> &'static [&'static Entity] {
     if gpu { &SUPPLIED } else { &SUPPLIED_NO_GPU }
@@ -81,11 +89,15 @@ pub async fn diagnose() {
     println!("diagnose is for Linux");
 }
 
-/// The receiver of the sleep and wake events. No Windows source sends one
-/// yet: the sender is dropped, and the run loop then never receives an event.
+/// The receiver of the session, sleep, wake and shutdown events of the
+/// service controls. In a console run no service sends an event: the sender
+/// is dropped, and the run loop then never receives an event.
 pub fn events() -> mpsc::Receiver<SystemEvent> {
-    let (_tx, rx) = mpsc::channel(4);
-    rx
+    EVENTS
+        .lock()
+        .ok()
+        .and_then(|mut events| events.take())
+        .unwrap_or_else(|| mpsc::channel(1).1)
 }
 
 #[cfg(test)]
@@ -106,12 +118,19 @@ mod tests {
                 "loggedusers",
                 "display",
                 "gpuload",
-                "gpupower"
+                "gpupower",
+                "lastsystemstatechange"
             ]
         );
         assert_eq!(
             names(false),
-            ["lastboot", "sessionstate", "loggedusers", "display"]
+            [
+                "lastboot",
+                "sessionstate",
+                "loggedusers",
+                "display",
+                "lastsystemstatechange"
+            ]
         );
     }
 
