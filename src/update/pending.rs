@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// The folder of `update-pending.json`, `update-state.json` and the lock file.
 #[cfg(target_os = "linux")]
@@ -46,6 +46,10 @@ pub const MAX_STARTS: u32 = 3;
 
 /// The wait before a confirm tries the install lock again.
 pub const CONFIRM_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the watch tries again to delete a `pc-agent.prev` that a
+/// confirm left; the next install deletes it after that.
+pub const PREV_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// The time after the first start in which the first ConnAck must come.
 pub const CONFIRM_WITHIN: TimeDelta = TimeDelta::minutes(10);
@@ -176,6 +180,9 @@ pub enum Confirm {
     NotPending,
     /// The update of this build is confirmed.
     Confirmed(BuildId),
+    /// The update is confirmed, but `pc-agent.prev` could not be deleted
+    /// (Windows: a process still runs from it): try that again later.
+    ConfirmedPrevLeft(BuildId),
     /// An install holds the lock: try again later.
     Busy,
 }
@@ -362,8 +369,34 @@ pub fn confirm(paths: &Paths) -> Result<Confirm> {
     // The pending file first: a stale prev is harmless (the next install
     // deletes it), a pending file with no prev is not.
     remove_if_present(&paths.pending())?;
-    remove_if_present(&paths.prev())?;
+    // On Windows the CLI that installed and the old helper can still run
+    // from pc-agent.prev.exe for a short time: the watch tries again.
+    if let Err(e) = remove_if_present(&paths.prev()) {
+        debug!("pc-agent.prev is left for now: {e:#}");
+        return Ok(Confirm::ConfirmedPrevLeft(pending.new));
+    }
     Ok(Confirm::Confirmed(pending.new))
+}
+
+/// The result of a later delete of a `pc-agent.prev` that a confirm left.
+#[derive(Debug, PartialEq)]
+enum PrevDelete {
+    Deleted,
+    /// An install holds the lock (it deletes or replaces prev itself).
+    Busy,
+    Failed(String),
+}
+
+/// Deletes a `pc-agent.prev` that a confirm left, under the install lock.
+fn remove_prev(paths: &Paths) -> PrevDelete {
+    match try_lock(paths) {
+        Ok(Some(_lock)) => match remove_if_present(&paths.prev()) {
+            Ok(()) => PrevDelete::Deleted,
+            Err(e) => PrevDelete::Failed(format!("{e:#}")),
+        },
+        Ok(None) => PrevDelete::Busy,
+        Err(e) => PrevDelete::Failed(format!("{e:#}")),
+    }
 }
 
 /// Moves `pc-agent.prev` back to the binary path, records the new build of
@@ -437,13 +470,22 @@ fn restore_prev(
 /// The update watch of the run loop: the first ConnAck confirms a pending
 /// update; with no ConnAck before the deadline, the run loop ends with a
 /// restart and the caller rolls back.
+/// What the watch tries again.
+#[derive(Clone, Copy, Debug)]
+enum Retry {
+    Confirm,
+    /// The delete of `pc-agent.prev`, until the given time.
+    Prev(tokio::time::Instant),
+}
+
 #[derive(Debug, Default)]
 pub struct Watch {
     paths: Option<Paths>,
     /// While a new build waits for its first ConnAck.
     deadline: Option<tokio::time::Instant>,
-    /// The next try of a confirm that found the install lock held.
-    retry: Option<tokio::time::Instant>,
+    /// The next try of a confirm that found the install lock held, or of
+    /// the delete of a `pc-agent.prev` that a confirm left.
+    retry: Option<(tokio::time::Instant, Retry)>,
     /// The first ConnAck came.
     connected: bool,
 }
@@ -472,9 +514,10 @@ impl Watch {
     }
 
     /// The time at which the run loop calls `on_deadline`: the rollback
-    /// deadline before the first ConnAck, or the next try of a confirm.
+    /// deadline before the first ConnAck, or the next try of a confirm or
+    /// of a prev delete.
     pub fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.retry.or(self.deadline)
+        self.retry.map(|(at, _)| at).or(self.deadline)
     }
 
     /// A ConnAck: the first one confirms a pending update.
@@ -496,13 +539,24 @@ impl Watch {
                 commit = %build.commit,
                 "the first ConnAck confirms the update"
             ),
+            Ok(Confirm::ConfirmedPrevLeft(build)) => {
+                info!(
+                    version = %build.version,
+                    commit = %build.commit,
+                    "the first ConnAck confirms the update; pc-agent.prev is still in use, \
+                     the delete tries again every {} s",
+                    CONFIRM_RETRY.as_secs()
+                );
+                let now = tokio::time::Instant::now();
+                self.retry = Some((now + CONFIRM_RETRY, Retry::Prev(now + PREV_RETRY_FOR)));
+            }
             Ok(Confirm::NotPending) => {}
             Ok(Confirm::Busy) => {
                 info!(
                     "an install holds the lock: the confirm tries again in {} s",
                     CONFIRM_RETRY.as_secs()
                 );
-                self.retry = Some(tokio::time::Instant::now() + CONFIRM_RETRY);
+                self.retry = Some((tokio::time::Instant::now() + CONFIRM_RETRY, Retry::Confirm));
             }
             Err(e) => warn!("cannot confirm the update: {e:#}"),
         }
@@ -511,12 +565,40 @@ impl Watch {
     /// The time of `deadline()` passed. Tries a busy confirm again, or
     /// rolls back; gives `true` when the run loop must end with a restart.
     pub fn on_deadline(&mut self) -> bool {
-        if self.retry.is_some() {
-            self.try_confirm();
-            return false;
+        match self.retry {
+            Some((_, Retry::Confirm)) => self.try_confirm(),
+            Some((_, Retry::Prev(until))) => self.try_remove_prev(until),
+            None => {
+                self.rollback();
+                return true;
+            }
         }
-        self.rollback();
-        true
+        false
+    }
+
+    /// Tries again to delete a `pc-agent.prev` that the confirm left, until
+    /// `until`; then gives up (the next install deletes a stale prev).
+    fn try_remove_prev(&mut self, until: tokio::time::Instant) {
+        self.retry = None;
+        let Some(paths) = &self.paths else { return };
+        let why = match remove_prev(paths) {
+            PrevDelete::Deleted => {
+                info!("deleted pc-agent.prev");
+                return;
+            }
+            PrevDelete::Busy => "an install holds the lock".to_string(),
+            PrevDelete::Failed(e) => e,
+        };
+        let next = tokio::time::Instant::now() + CONFIRM_RETRY;
+        if next > until {
+            warn!(
+                "pc-agent.prev is still there after {} min ({why}); the next install deletes it",
+                PREV_RETRY_FOR.as_secs() / 60
+            );
+        } else {
+            debug!("pc-agent.prev is left for now: {why}");
+            self.retry = Some((next, Retry::Prev(until)));
+        }
     }
 
     /// The rollback after the deadline (the caller exits after it).
@@ -901,6 +983,79 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["update-pending.json"]);
+    }
+
+    /// A `pc-agent.prev` that cannot be deleted: a folder with a file in it
+    /// (on Windows the same error comes from a process that runs from it).
+    fn prev_held(paths: &Paths) {
+        fs::remove_file(paths.prev()).unwrap();
+        fs::create_dir_all(paths.prev().join("x")).unwrap();
+    }
+
+    #[test]
+    fn a_prev_that_cannot_be_deleted_does_not_fail_the_confirm() {
+        let paths = setup("prev-held");
+        pending_installed(&paths);
+        prev_held(&paths);
+        assert_eq!(
+            confirm(&paths).unwrap(),
+            Confirm::ConfirmedPrevLeft(id("0.3.0", NEW))
+        );
+        assert!(!paths.pending().exists());
+        assert!(paths.prev().exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_deletes_a_left_prev_later() {
+        let paths = setup("prev-retry");
+        pending_installed(&paths);
+        prev_held(&paths);
+        let start = on_start(&paths, &id("0.3.0", NEW), at(0));
+        let mut watch = Watch::new(paths.clone(), &start, at(0));
+        watch.connected();
+        assert!(!paths.pending().exists(), "the confirm is done");
+        let next = watch.deadline().expect("a prev retry is scheduled");
+        assert_eq!(next - tokio::time::Instant::now(), CONFIRM_RETRY);
+        // Still held at the first retry.
+        tokio::time::advance(CONFIRM_RETRY).await;
+        assert!(!watch.on_deadline(), "a prev retry is not a restart");
+        assert!(watch.deadline().is_some());
+        // An install holds the lock: skipped, still scheduled.
+        fs::remove_dir_all(paths.prev()).unwrap();
+        fs::write(paths.prev(), "old build").unwrap();
+        let lock = try_lock(&paths).unwrap().unwrap();
+        tokio::time::advance(CONFIRM_RETRY).await;
+        assert!(!watch.on_deadline());
+        assert!(paths.prev().exists());
+        assert!(watch.deadline().is_some());
+        drop(lock);
+        // The process exited: the next retry deletes it.
+        tokio::time::advance(CONFIRM_RETRY).await;
+        assert!(!watch.on_deadline());
+        assert!(!paths.prev().exists());
+        assert_eq!(watch.deadline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_gives_up_on_a_left_prev_after_10_min() {
+        let paths = setup("prev-give-up");
+        pending_installed(&paths);
+        prev_held(&paths);
+        let start = on_start(&paths, &id("0.3.0", NEW), at(0));
+        let mut watch = Watch::new(paths.clone(), &start, at(0));
+        let begin = tokio::time::Instant::now();
+        watch.connected();
+        let mut tries = 0;
+        while let Some(next) = watch.deadline() {
+            tokio::time::advance(next - tokio::time::Instant::now()).await;
+            assert!(!watch.on_deadline());
+            tries += 1;
+            assert!(tries <= 200, "the retry never stops");
+        }
+        let spent = tokio::time::Instant::now() - begin;
+        assert!(spent <= PREV_RETRY_FOR, "{spent:?}");
+        assert!(spent + CONFIRM_RETRY > PREV_RETRY_FOR, "{spent:?}");
+        assert!(paths.prev().exists(), "the next install deletes it");
     }
 
     #[test]
