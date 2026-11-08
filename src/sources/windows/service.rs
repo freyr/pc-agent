@@ -1,26 +1,32 @@
 //! The service frame: the dispatcher, the control handler and the service
 //! status. The handler forwards each control to the runtime through a
 //! channel and returns at once. `Stop` and `Preshutdown` stop the agent: it
-//! publishes the retained `offline` and disconnects. The session and power
+//! publishes the retained `offline` and disconnects. The handler records
+//! each console display notification for the poll. The session and power
 //! controls reach the runtime too; the later tasks handle them.
 
 use std::ffi::OsString;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use ::windows::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
+use ::windows::Win32::Foundation::{ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, HANDLE};
+use ::windows::Win32::System::Power::RegisterPowerSettingNotification;
+use ::windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+use ::windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_SERVICE_HANDLE;
 use anyhow::Result;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{debug, error, info, warn};
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+    PowerBroadcastSetting, PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode,
+    ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use super::{DATA_DIR, SERVICE_NAME};
+use super::{DATA_DIR, DISPLAY, SERVICE_NAME};
 use crate::logfile::LogFile;
 
 /// The size limit of the log file; one old file is kept.
@@ -105,6 +111,12 @@ fn run_service() -> Result<()> {
         | ServiceControl::Preshutdown
         | ServiceControl::SessionChange(_)
         | ServiceControl::PowerEvent(_) => {
+            if let ServiceControl::PowerEvent(PowerEventParam::PowerSettingChange(
+                PowerBroadcastSetting::ConsoleDisplayState(state),
+            )) = &control
+            {
+                DISPLAY.record(state.to_raw());
+            }
             // The runtime is gone after the stop: nothing to forward to then.
             let _ = tx.send(control);
             ServiceControlHandlerResult::NoError
@@ -112,6 +124,17 @@ fn run_service() -> Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let handle = service_control_handler::register(SERVICE_NAME, handler)?;
+    // SAFETY: the status handle stays valid while the service runs; the
+    // registration ends with the process.
+    if let Err(e) = unsafe {
+        RegisterPowerSettingNotification(
+            HANDLE(handle.as_raw_handle()),
+            &GUID_CONSOLE_DISPLAY_STATE,
+            DEVICE_NOTIFY_SERVICE_HANDLE,
+        )
+    } {
+        warn!("no display state: RegisterPowerSettingNotification failed: {e}");
+    }
     handle.set_service_status(status(ServiceState::Running, ACCEPTED, 0))?;
 
     let config = CONFIG
