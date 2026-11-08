@@ -158,9 +158,13 @@ pub enum Start {
     /// again. The service must exit.
     RollbackFailed(String),
     /// The pending file is left from an install that stopped before the
-    /// swap (the running build is its old build): it was deleted, and the
-    /// service runs.
+    /// swap (the running build is its old build, the start count is 0): it
+    /// was deleted, and the service runs.
     Stale(BuildId),
+    /// The old build runs after a rollback that stopped before it recorded
+    /// the failed build (the new build had started): it is recorded now,
+    /// the pending file is deleted, and the service runs.
+    RollbackFinished(BuildId),
     /// The pending file could not be read or written; the service runs.
     Error(String),
 }
@@ -299,12 +303,21 @@ pub fn on_start(paths: &Paths, running: &BuildId, now: DateTime<Utc>) -> Start {
             });
         }
     };
-    // An install that stopped after the pending write and before the swap:
-    // the old build still runs, and no prev may exist to roll back to.
+    // The old build runs with a pending file. The count, read before any
+    // increment, tells why. 0: an install that stopped after the pending
+    // write and before the swap (the new build never ran): stale. 1 or
+    // more: a rollback that moved prev back and stopped before it recorded
+    // the failed build: finish it.
     if running == &pending.old && running != &pending.new {
-        return match remove_if_present(&path) {
-            Ok(()) => Start::Stale(pending.new),
-            Err(e) => Start::Error(format!("{e:#}")),
+        if pending.starts == 0 {
+            return match remove_if_present(&path) {
+                Ok(()) => Start::Stale(pending.new),
+                Err(e) => Start::Error(format!("{e:#}")),
+            };
+        }
+        return match record_failed(paths, &pending) {
+            Ok(()) => Start::RollbackFinished(pending.new),
+            Err(e) => Start::Error(format!("cannot finish the rollback: {e:#}")),
         };
     }
     pending.starts += 1;
@@ -371,6 +384,12 @@ fn rollback_from(paths: &Paths, pending: &Pending) -> Result<()> {
         // Windows cannot replace the running image, only rename it.
         restore_prev(paths, cfg!(windows), |from, to| fs::rename(from, to))?;
     }
+    record_failed(paths, pending)
+}
+
+/// Records the new build of `pending` as failed in `update-state.json` (by
+/// commit, once), then deletes the pending file.
+fn record_failed(paths: &Paths, pending: &Pending) -> Result<()> {
     let mut state = read_state(paths)?;
     if !state.failed.iter().any(|b| b.commit == pending.new.commit) {
         state.failed.push(pending.new.clone());
@@ -522,6 +541,7 @@ mod tests {
 
     const OLD: &str = "1111111111111111111111111111111111111111";
     const NEW: &str = "2222222222222222222222222222222222222222";
+    const THIRD: &str = "3333333333333333333333333333333333333333";
 
     /// A temporary state folder and a binary folder with `pc-agent` (the new
     /// build) and `pc-agent.prev` (the old one).
@@ -770,6 +790,7 @@ mod tests {
     #[test]
     fn a_pending_file_of_an_install_that_stopped_before_the_swap_is_stale() {
         let paths = setup("stale");
+        // Written by the install, never counted: the new build never ran.
         pending_installed(&paths);
         // The running build is the old build of the pending file.
         let start = on_start(&paths, &id("0.3.0", OLD), at(0));
@@ -778,14 +799,35 @@ mod tests {
         assert!(!paths.pending().exists());
         assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "new build");
         assert!(read_state(&paths).unwrap().failed.is_empty());
-        // Also at the third start: no rollback to nothing.
+    }
+
+    #[test]
+    fn a_rollback_that_stopped_before_its_record_is_finished_by_the_old_build() {
+        let paths = setup("half-rollback");
+        // The new build ran twice; a rollback moved prev back and stopped
+        // before it recorded the failed build.
         let mut p = Pending::new(id("0.3.0", OLD), id("0.3.1", NEW));
         p.starts = 2;
+        p.first_start = Some("2026-11-08T12:00:00Z".to_string());
         write_pending(&paths, &p).unwrap();
         fs::remove_file(paths.prev()).unwrap();
-        let start = on_start(&paths, &id("0.3.0", OLD), at(0));
-        assert_eq!(start, Start::Stale(id("0.3.1", NEW)));
-        assert!(read_state(&paths).unwrap().failed.is_empty());
+        fs::write(&paths.exe, "old build").unwrap();
+        let start = on_start(&paths, &id("0.3.0", OLD), at(1));
+        assert_eq!(start, Start::RollbackFinished(id("0.3.1", NEW)));
+        assert!(!start.must_exit(), "the old build already runs");
+        assert!(!paths.pending().exists());
+        assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "old build");
+        assert_eq!(read_state(&paths).unwrap().failed, vec![id("0.3.1", NEW)]);
+        // Also after one start of the new build.
+        let mut p = Pending::new(id("0.3.0", OLD), id("0.3.2", THIRD));
+        p.starts = 1;
+        write_pending(&paths, &p).unwrap();
+        let start = on_start(&paths, &id("0.3.0", OLD), at(1));
+        assert_eq!(start, Start::RollbackFinished(id("0.3.2", THIRD)));
+        assert_eq!(
+            read_state(&paths).unwrap().failed,
+            vec![id("0.3.1", NEW), id("0.3.2", THIRD)]
+        );
     }
 
     #[test]

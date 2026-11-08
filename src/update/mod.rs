@@ -76,6 +76,11 @@ pub fn log_start(start: &Start) {
             commit = %new.commit,
             "deleted the pending file of an install that stopped before the swap"
         ),
+        Start::RollbackFinished(failed) => tracing::warn!(
+            version = %failed.version,
+            commit = %failed.commit,
+            "finished a rollback that stopped before its record: the build is recorded as failed"
+        ),
         Start::Error(e) => tracing::warn!("update check at start: {e}"),
     }
 }
