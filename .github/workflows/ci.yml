@@ -80,11 +80,28 @@ jobs:
           path: target/release/pc-agent.exe
           if-no-files-found: error
 
+      - name: Restore the Mosquitto installer from the cache
+        id: mosquitto-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/mosquitto-2.0.22-install-windows-x64.exe
+          key: mosquitto-2.0.22-install-windows-x64
+
+      - name: Download the Mosquitto installer
+        if: steps.mosquitto-cache.outputs.cache-hit != 'true'
+        run: |
+          # Chocolatey has no mosquitto package: use the official installer.
+          # mosquitto.org sometimes drops the connection ("unexpected EOF"),
+          # and Invoke-WebRequest does not retry that, so use curl.
+          curl.exe --fail --location --retry 8 --retry-all-errors --retry-delay 5 `
+            --output "$HOME\mosquitto-2.0.22-install-windows-x64.exe" `
+            "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "the Mosquitto download failed" }
+
       - name: Start a Mosquitto broker on 127.0.0.1:1883
         run: |
-          # Chocolatey has no mosquitto package: use the official installer (NSIS, silent).
-          $setup = Join-Path $env:RUNNER_TEMP "mosquitto-setup.exe"
-          Invoke-WebRequest -Uri "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe" -OutFile $setup -MaximumRetryCount 5 -RetryIntervalSec 10
+          # The official installer (NSIS, silent).
+          $setup = "$HOME\mosquitto-2.0.22-install-windows-x64.exe"
           $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "the mosquitto installer failed with $($p.ExitCode)" }
           # The runner ends background processes at the end of a step, so the
