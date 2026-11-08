@@ -4,7 +4,7 @@
 //! to the binary path, and restart the service. A lock file in the state
 //! folder stops two installs at the same time (the CLI and the service).
 
-use std::fs::{self, File, TryLockError};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use super::check::{self, Build, Channel, Outcome};
-use super::pending::{self, BuildId, Paths, Pending, remove_if_present};
+use super::pending::{self, BuildId, Lock, Paths, Pending, remove_if_present};
 use super::{Asset, Manifest};
 
 /// The largest binary that the install downloads.
@@ -26,35 +26,14 @@ const STAGED_NAME: &str = if cfg!(windows) {
     "pc-agent.download"
 };
 
-/// The lock of an install; the OS releases it when the process ends.
-#[derive(Debug)]
-pub struct Lock {
-    _file: File,
-}
-
 /// Takes the install lock in the state folder (created when missing).
 pub fn lock(paths: &Paths) -> Result<Lock> {
-    fs::create_dir_all(&paths.state_dir).with_context(|| {
-        format!(
-            "cannot create {} (run as root or admin)",
-            paths.state_dir.display()
-        )
-    })?;
-    let path = paths.lock();
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("cannot open {} (run as root or admin)", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Lock { _file: file }),
-        Err(TryLockError::WouldBlock) => {
-            bail!("another install runs ({} is locked)", path.display())
-        }
-        Err(TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("cannot lock {}", path.display()))
-        }
+    match pending::try_lock(paths)? {
+        Some(lock) => Ok(lock),
+        None => bail!(
+            "another install runs ({} is locked)",
+            paths.lock().display()
+        ),
     }
 }
 
@@ -137,6 +116,13 @@ fn try_swap(paths: &Paths, staged: &Path, pending: &Pending) -> Result<()> {
     if cfg!(windows) {
         // Left by a rollback; it does not stop the install.
         let _ = remove_if_present(&paths.failed_exe());
+    }
+    // First, and durable: a crash after it leaves the old binary with a
+    // pending file that names it as the old build, which the next start
+    // deletes as stale. On Windows only two renames are then left in the
+    // time with no binary at the path.
+    pending::write_pending(paths, pending)?;
+    let kept = if cfg!(windows) {
         // Windows cannot replace a running image, but it can rename it.
         fs::rename(&paths.exe, &prev).with_context(|| {
             format!(
@@ -144,34 +130,33 @@ fn try_swap(paths: &Paths, staged: &Path, pending: &Pending) -> Result<()> {
                 paths.exe.display(),
                 prev.display()
             )
-        })?;
+        })
     } else {
         // A hard link: the binary path is never missing.
-        fs::hard_link(&paths.exe, &prev).with_context(|| {
-            format!("cannot keep {} as {}", paths.exe.display(), prev.display())
-        })?;
+        fs::hard_link(&paths.exe, &prev)
+            .with_context(|| format!("cannot keep {} as {}", paths.exe.display(), prev.display()))
+    };
+    if let Err(e) = kept {
+        let _ = remove_if_present(&paths.pending());
+        return Err(e);
     }
-    // Before the rename: a crash between the two leaves a pending file that
-    // the old binary confirms, never a new binary with no rollback.
-    let moved = pending::write_pending(paths, pending).and_then(|()| {
-        fs::rename(staged, &paths.exe).with_context(|| {
-            format!(
-                "cannot move {} to {}",
-                staged.display(),
-                paths.exe.display()
-            )
-        })
+    let moved = fs::rename(staged, &paths.exe).with_context(|| {
+        format!(
+            "cannot move {} to {}",
+            staged.display(),
+            paths.exe.display()
+        )
     });
     if let Err(e) = moved {
-        let _ = remove_if_present(&paths.pending());
         if cfg!(windows) {
             let _ = fs::rename(&prev, &paths.exe);
         } else {
             let _ = fs::remove_file(&prev);
         }
+        let _ = remove_if_present(&paths.pending());
         return Err(e);
     }
-    Ok(())
+    pending::sync_dir(paths.exe_dir())
 }
 
 /// The asset to install for `outcome`. A build that failed once installs
@@ -265,6 +250,14 @@ fn try_update(flag: Option<Channel>, config: &Path) -> Result<()> {
     );
     let paths = Paths::system()?;
     let lock = lock(&paths)?;
+    if let Some(earlier) = pending::read_pending(&paths)? {
+        bail!(
+            "the update to {} commit {} is still pending (no ConnAck yet); try again after \
+             the service connects or rolls back",
+            earlier.new.version,
+            earlier.new.commit
+        );
+    }
     let (channel, from) = check::channel_of(flag, config)?;
     println!("channel: {channel} ({from})");
     let failed = pending::read_state(&paths)?.failed_commits();
@@ -418,6 +411,20 @@ mod tests {
         assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "running build");
         assert!(!paths.pending().exists());
         assert!(!staged.exists(), "the download is deleted");
+    }
+
+    #[test]
+    fn a_failed_keep_of_the_running_binary_deletes_the_pending_file() {
+        let paths = setup("keep");
+        let lock = lock(&paths).unwrap();
+        let staged = stage(&paths, &b"new build"[..], &sha(b"new build")).unwrap();
+        // No binary to keep: the link or the rename after the pending write fails.
+        fs::remove_file(&paths.exe).unwrap();
+        let e = swap(&lock, &paths, &staged, &pending()).unwrap_err();
+        assert!(format!("{e:#}").contains("prev"), "{e:#}");
+        assert!(!paths.pending().exists());
+        assert!(!paths.prev().exists());
+        assert!(!staged.exists());
     }
 
     #[test]

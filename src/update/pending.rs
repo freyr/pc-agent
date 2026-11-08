@@ -9,11 +9,11 @@
 //! Only the service path reads and changes the start count (see `main`): a
 //! CLI run never calls `on_start` or `Watch`.
 
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File, TryLockError};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -43,6 +43,9 @@ const FAILED_NAME: &str = "pc-agent.failed.exe";
 
 /// The start that reaches this count with no ConnAck rolls back.
 pub const MAX_STARTS: u32 = 3;
+
+/// The wait before a confirm tries the install lock again.
+pub const CONFIRM_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The time after the first start in which the first ConnAck must come.
 pub const CONFIRM_WITHIN: TimeDelta = TimeDelta::minutes(10);
@@ -154,8 +157,55 @@ pub enum Start {
     /// The rollback failed; the pending file stays, so the next start tries
     /// again. The service must exit.
     RollbackFailed(String),
+    /// The pending file is left from an install that stopped before the
+    /// swap (the running build is its old build): it was deleted, and the
+    /// service runs.
+    Stale(BuildId),
     /// The pending file could not be read or written; the service runs.
     Error(String),
+}
+
+/// The result of a confirm.
+#[derive(Debug, PartialEq)]
+pub enum Confirm {
+    /// No update was pending.
+    NotPending,
+    /// The update of this build is confirmed.
+    Confirmed(BuildId),
+    /// An install holds the lock: try again later.
+    Busy,
+}
+
+/// The lock of an install and of a confirm; the OS releases it when the
+/// process ends.
+#[derive(Debug)]
+pub struct Lock {
+    _file: File,
+}
+
+/// Takes the install lock in the state folder (created when missing).
+/// `None` when another process holds it.
+pub fn try_lock(paths: &Paths) -> Result<Option<Lock>> {
+    fs::create_dir_all(&paths.state_dir).with_context(|| {
+        format!(
+            "cannot create {} (run as root or admin)",
+            paths.state_dir.display()
+        )
+    })?;
+    let path = paths.lock();
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("cannot open {} (run as root or admin)", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(Lock { _file: file })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("cannot lock {}", path.display()))
+        }
+    }
 }
 
 impl Start {
@@ -177,13 +227,31 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     }
 }
 
-/// Writes a JSON file through a temporary file and a rename, so a reader
-/// never sees half a file.
+/// Writes a JSON file through a temporary file in the same folder, synced
+/// to the disk before the rename (and the folder after it on Unix), so a
+/// reader never sees half a file and a power loss keeps the file.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(value)?;
-    fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))
+    let mut file = File::create(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    drop(file);
+    fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
+    sync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
+/// Unix: syncs a folder, so a rename in it is on the disk. Windows has no
+/// folder sync (NTFS logs the rename).
+pub(super) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("cannot sync {}", dir.display()))?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Deletes a file; a missing file is not an error.
@@ -213,7 +281,7 @@ pub fn read_state(paths: &Paths) -> Result<UpdateState> {
 /// The pending-file check, the first step of the service path: adds 1 to
 /// the start count, and rolls back at the third start or when 10 min have
 /// passed since the first start.
-pub fn on_start(paths: &Paths, now: DateTime<Utc>) -> Start {
+pub fn on_start(paths: &Paths, running: &BuildId, now: DateTime<Utc>) -> Start {
     let path = paths.pending();
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -231,6 +299,14 @@ pub fn on_start(paths: &Paths, now: DateTime<Utc>) -> Start {
             });
         }
     };
+    // An install that stopped after the pending write and before the swap:
+    // the old build still runs, and no prev may exist to roll back to.
+    if running == &pending.old && running != &pending.new {
+        return match remove_if_present(&path) {
+            Ok(()) => Start::Stale(pending.new),
+            Err(e) => Start::Error(format!("{e:#}")),
+        };
+    }
     pending.starts += 1;
     let first = pending
         .first_start
@@ -257,17 +333,24 @@ pub fn on_start(paths: &Paths, now: DateTime<Utc>) -> Start {
     }
 }
 
-/// The first ConnAck: deletes `update-pending.json`, then `pc-agent.prev`.
-/// Returns the confirmed build, or `None` when no update was pending.
-pub fn confirm(paths: &Paths) -> Result<Option<BuildId>> {
+/// The first ConnAck: deletes `update-pending.json`, then `pc-agent.prev`,
+/// under the install lock; `Busy` when an install holds it.
+pub fn confirm(paths: &Paths) -> Result<Confirm> {
+    if read_pending(paths)?.is_none() {
+        return Ok(Confirm::NotPending);
+    }
+    // An install between the two deletes would lose its new prev.
+    let Some(_lock) = try_lock(paths)? else {
+        return Ok(Confirm::Busy);
+    };
     let Some(pending) = read_pending(paths)? else {
-        return Ok(None);
+        return Ok(Confirm::NotPending);
     };
     // The pending file first: a stale prev is harmless (the next install
     // deletes it), a pending file with no prev is not.
     remove_if_present(&paths.pending())?;
     remove_if_present(&paths.prev())?;
-    Ok(Some(pending.new))
+    Ok(Confirm::Confirmed(pending.new))
 }
 
 /// Moves `pc-agent.prev` back to the binary path, records the new build of
@@ -284,21 +367,9 @@ pub fn rollback(paths: &Paths) -> Result<Option<BuildId>> {
 /// The rollback of `pending`. With no `pc-agent.prev` (a crash after an
 /// earlier rollback moved it back) the binary stays as it is.
 fn rollback_from(paths: &Paths, pending: &Pending) -> Result<()> {
-    let prev = paths.prev();
-    if prev.exists() {
+    if paths.prev().exists() {
         // Windows cannot replace the running image, only rename it.
-        if cfg!(windows) {
-            fs::rename(&paths.exe, paths.failed_exe()).with_context(|| {
-                format!("cannot rename {} to {}", paths.exe.display(), FAILED_NAME)
-            })?;
-        }
-        fs::rename(&prev, &paths.exe).with_context(|| {
-            format!(
-                "cannot move {} back to {}",
-                prev.display(),
-                paths.exe.display()
-            )
-        })?;
+        restore_prev(paths, cfg!(windows), |from, to| fs::rename(from, to))?;
     }
     let mut state = read_state(paths)?;
     if !state.failed.iter().any(|b| b.commit == pending.new.commit) {
@@ -306,6 +377,42 @@ fn rollback_from(paths: &Paths, pending: &Pending) -> Result<()> {
     }
     write_json(&paths.state(), &state)?;
     remove_if_present(&paths.pending())
+}
+
+/// Moves `pc-agent.prev` to the binary path. With `rename_running` (Windows)
+/// the running binary moves to `pc-agent.failed.exe` first. `rename` is
+/// `fs::rename` (a test passes one that fails).
+fn restore_prev(
+    paths: &Paths,
+    rename_running: bool,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
+    let prev = paths.prev();
+    if rename_running {
+        rename(&paths.exe, &paths.failed_exe())
+            .with_context(|| format!("cannot rename {} to {}", paths.exe.display(), FAILED_NAME))?;
+    }
+    let moved = rename(&prev, &paths.exe).with_context(|| {
+        format!(
+            "cannot move {} back to {}",
+            prev.display(),
+            paths.exe.display()
+        )
+    });
+    if let Err(e) = moved {
+        if rename_running {
+            // Never leave the binary path empty: put the running binary back.
+            if let Err(undo) = rename(&paths.failed_exe(), &paths.exe) {
+                return Err(anyhow!(
+                    "{e:#}; cannot rename {} back to {}: {undo}",
+                    FAILED_NAME,
+                    paths.exe.display()
+                ));
+            }
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The update watch of the run loop: the first ConnAck confirms a pending
@@ -316,6 +423,8 @@ pub struct Watch {
     paths: Option<Paths>,
     /// While a new build waits for its first ConnAck.
     deadline: Option<tokio::time::Instant>,
+    /// The next try of a confirm that found the install lock held.
+    retry: Option<tokio::time::Instant>,
     /// The first ConnAck came.
     connected: bool,
 }
@@ -338,13 +447,15 @@ impl Watch {
         Watch {
             paths: Some(paths),
             deadline,
+            retry: None,
             connected: false,
         }
     }
 
-    /// The time at which the run loop ends with a restart, for the rollback.
+    /// The time at which the run loop calls `on_deadline`: the rollback
+    /// deadline before the first ConnAck, or the next try of a confirm.
     pub fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.deadline
+        self.retry.or(self.deadline)
     }
 
     /// A ConnAck: the first one confirms a pending update.
@@ -354,20 +465,43 @@ impl Watch {
         }
         self.connected = true;
         self.deadline = None;
+        self.try_confirm();
+    }
+
+    fn try_confirm(&mut self) {
+        self.retry = None;
         let Some(paths) = &self.paths else { return };
         match confirm(paths) {
-            Ok(Some(build)) => info!(
+            Ok(Confirm::Confirmed(build)) => info!(
                 version = %build.version,
                 commit = %build.commit,
                 "the first ConnAck confirms the update"
             ),
-            Ok(None) => {}
+            Ok(Confirm::NotPending) => {}
+            Ok(Confirm::Busy) => {
+                info!(
+                    "an install holds the lock: the confirm tries again in {} s",
+                    CONFIRM_RETRY.as_secs()
+                );
+                self.retry = Some(tokio::time::Instant::now() + CONFIRM_RETRY);
+            }
             Err(e) => warn!("cannot confirm the update: {e:#}"),
         }
     }
 
+    /// The time of `deadline()` passed. Tries a busy confirm again, or
+    /// rolls back; gives `true` when the run loop must end with a restart.
+    pub fn on_deadline(&mut self) -> bool {
+        if self.retry.is_some() {
+            self.try_confirm();
+            return false;
+        }
+        self.rollback();
+        true
+    }
+
     /// The rollback after the deadline (the caller exits after it).
-    pub fn rollback(&self) {
+    fn rollback(&self) {
         let Some(paths) = &self.paths else { return };
         match rollback(paths) {
             Ok(Some(failed)) => warn!(
@@ -440,13 +574,13 @@ mod tests {
     #[test]
     fn no_pending_file_is_a_normal_start() {
         let paths = setup("none");
-        assert_eq!(on_start(&paths, at(0)), Start::Normal);
+        assert_eq!(on_start(&paths, &id("0.3.0", NEW), at(0)), Start::Normal);
         assert!(!paths.pending().exists());
         assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "new build");
         // No state folder at all (a console run as a user): also normal.
         let mut missing = paths.clone();
         missing.state_dir = paths.state_dir.join("no-such-dir");
-        assert_eq!(on_start(&missing, at(0)), Start::Normal);
+        assert_eq!(on_start(&missing, &id("0.3.0", NEW), at(0)), Start::Normal);
     }
 
     #[test]
@@ -454,7 +588,7 @@ mod tests {
         let paths = setup("count");
         pending_installed(&paths);
         assert_eq!(
-            on_start(&paths, at(0)),
+            on_start(&paths, &id("0.3.0", NEW), at(0)),
             Start::Pending {
                 starts: 1,
                 deadline: at(10),
@@ -466,7 +600,7 @@ mod tests {
         assert_eq!(p.first_start.as_deref(), Some("2026-11-08T12:00:00Z"));
         // The deadline stays 10 min after the first start.
         assert_eq!(
-            on_start(&paths, at(3)),
+            on_start(&paths, &id("0.3.0", NEW), at(3)),
             Start::Pending {
                 starts: 2,
                 deadline: at(10),
@@ -481,20 +615,29 @@ mod tests {
     fn the_third_start_with_no_connack_rolls_back() {
         let paths = setup("third");
         pending_installed(&paths);
-        assert!(matches!(on_start(&paths, at(0)), Start::Pending { .. }));
-        assert!(matches!(on_start(&paths, at(1)), Start::Pending { .. }));
-        let start = on_start(&paths, at(2));
+        assert!(matches!(
+            on_start(&paths, &id("0.3.0", NEW), at(0)),
+            Start::Pending { .. }
+        ));
+        assert!(matches!(
+            on_start(&paths, &id("0.3.0", NEW), at(1)),
+            Start::Pending { .. }
+        ));
+        let start = on_start(&paths, &id("0.3.0", NEW), at(2));
         assert_rolled_back(&paths, start);
         // The old binary starts next: no pending file, a normal start.
-        assert_eq!(on_start(&paths, at(3)), Start::Normal);
+        assert_eq!(on_start(&paths, &id("0.3.0", NEW), at(3)), Start::Normal);
     }
 
     #[test]
     fn a_start_10_min_after_the_first_rolls_back() {
         let paths = setup("late");
         pending_installed(&paths);
-        assert!(matches!(on_start(&paths, at(0)), Start::Pending { .. }));
-        let start = on_start(&paths, at(10));
+        assert!(matches!(
+            on_start(&paths, &id("0.3.0", NEW), at(0)),
+            Start::Pending { .. }
+        ));
+        let start = on_start(&paths, &id("0.3.0", NEW), at(10));
         assert_rolled_back(&paths, start);
     }
 
@@ -502,16 +645,16 @@ mod tests {
     async fn the_watch_rolls_back_10_min_after_the_first_start() {
         let paths = setup("watch");
         pending_installed(&paths);
-        let start = on_start(&paths, at(0));
+        let start = on_start(&paths, &id("0.3.0", NEW), at(0));
         // The service starts 4 min after the first start: 6 min are left.
-        let watch = Watch::new(paths.clone(), &start, at(4));
+        let mut watch = Watch::new(paths.clone(), &start, at(4));
         let left = watch.deadline().unwrap() - tokio::time::Instant::now();
         assert_eq!(left, std::time::Duration::from_secs(6 * 60));
-        watch.rollback();
+        assert!(watch.on_deadline());
         assert_rolled_back(&paths, Start::RolledBack(id("0.3.0", NEW)));
         // A watch past its deadline ends the run loop at once.
         pending_installed(&paths);
-        let start = on_start(&paths, at(0));
+        let start = on_start(&paths, &id("0.3.0", NEW), at(0));
         let watch = Watch::new(paths.clone(), &start, at(11));
         assert_eq!(watch.deadline(), Some(tokio::time::Instant::now()));
     }
@@ -520,7 +663,7 @@ mod tests {
     fn the_first_connack_confirms() {
         let paths = setup("confirm");
         pending_installed(&paths);
-        let start = on_start(&paths, at(0));
+        let start = on_start(&paths, &id("0.3.0", NEW), at(0));
         let mut watch = Watch::new(paths.clone(), &start, at(0));
         assert!(watch.deadline().is_some());
         watch.connected();
@@ -534,6 +677,7 @@ mod tests {
         assert!(read_state(&paths).unwrap().failed.is_empty());
         // A rollback after the confirm does nothing.
         watch.rollback();
+        assert!(watch.deadline().is_none());
         assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "new build");
         assert!(read_state(&paths).unwrap().failed.is_empty());
     }
@@ -542,12 +686,15 @@ mod tests {
     fn confirm_gives_the_build_once_and_keeps_prev_with_no_pending_file() {
         let paths = setup("confirm-once");
         // No pending file: a kept prev is not this start's business.
-        assert_eq!(confirm(&paths).unwrap(), None);
+        assert_eq!(confirm(&paths).unwrap(), Confirm::NotPending);
         assert!(paths.prev().exists());
         pending_installed(&paths);
-        assert_eq!(confirm(&paths).unwrap(), Some(id("0.3.0", NEW)));
+        assert_eq!(
+            confirm(&paths).unwrap(),
+            Confirm::Confirmed(id("0.3.0", NEW))
+        );
         assert!(!paths.prev().exists());
-        assert_eq!(confirm(&paths).unwrap(), None);
+        assert_eq!(confirm(&paths).unwrap(), Confirm::NotPending);
     }
 
     #[test]
@@ -581,7 +728,10 @@ mod tests {
     fn a_bad_pending_file_is_deleted_and_the_start_is_normal() {
         let paths = setup("bad");
         fs::write(paths.pending(), "{ not json").unwrap();
-        assert!(matches!(on_start(&paths, at(0)), Start::Error(_)));
+        assert!(matches!(
+            on_start(&paths, &id("0.3.0", NEW), at(0)),
+            Start::Error(_)
+        ));
         assert!(!paths.pending().exists());
         assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "new build");
     }
@@ -591,7 +741,10 @@ mod tests {
         let paths = setup("unreadable");
         // A folder in place of the file: the read fails, the parse never runs.
         fs::create_dir_all(paths.pending().join("x")).unwrap();
-        assert!(matches!(on_start(&paths, at(0)), Start::Error(_)));
+        assert!(matches!(
+            on_start(&paths, &id("0.3.0", NEW), at(0)),
+            Start::Error(_)
+        ));
         assert!(paths.pending().join("x").exists());
         // A valid file with no read access: an I/O error, not a bad file.
         #[cfg(unix)]
@@ -602,13 +755,110 @@ mod tests {
             fs::set_permissions(paths.pending(), fs::Permissions::from_mode(0o000)).unwrap();
             // Root reads it anyway: nothing to test then.
             if fs::read(paths.pending()).is_err() {
-                assert!(matches!(on_start(&paths, at(0)), Start::Error(_)));
+                assert!(matches!(
+                    on_start(&paths, &id("0.3.0", NEW), at(0)),
+                    Start::Error(_)
+                ));
                 assert!(
                     paths.pending().exists(),
                     "a file that could not be read was deleted"
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_pending_file_of_an_install_that_stopped_before_the_swap_is_stale() {
+        let paths = setup("stale");
+        pending_installed(&paths);
+        // The running build is the old build of the pending file.
+        let start = on_start(&paths, &id("0.3.0", OLD), at(0));
+        assert_eq!(start, Start::Stale(id("0.3.0", NEW)));
+        assert!(!start.must_exit());
+        assert!(!paths.pending().exists());
+        assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "new build");
+        assert!(read_state(&paths).unwrap().failed.is_empty());
+        // Also at the third start: no rollback to nothing.
+        let mut p = Pending::new(id("0.3.0", OLD), id("0.3.1", NEW));
+        p.starts = 2;
+        write_pending(&paths, &p).unwrap();
+        fs::remove_file(paths.prev()).unwrap();
+        let start = on_start(&paths, &id("0.3.0", OLD), at(0));
+        assert_eq!(start, Start::Stale(id("0.3.1", NEW)));
+        assert!(read_state(&paths).unwrap().failed.is_empty());
+    }
+
+    #[test]
+    fn a_failed_move_of_prev_puts_the_running_binary_back() {
+        let paths = setup("undo");
+        let mut calls = 0;
+        let e = restore_prev(&paths, true, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                Err(io::Error::other("held by another process"))
+            } else {
+                fs::rename(from, to)
+            }
+        })
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("held by another process"),
+            "{e:#}"
+        );
+        assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "new build");
+        assert!(!paths.failed_exe().exists());
+        assert_eq!(fs::read_to_string(paths.prev()).unwrap(), "old build");
+        // The Windows rollback with no fault: the failed build is kept aside.
+        restore_prev(&paths, true, |from, to| fs::rename(from, to)).unwrap();
+        assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "old build");
+        assert_eq!(fs::read_to_string(paths.failed_exe()).unwrap(), "new build");
+    }
+
+    #[test]
+    fn a_confirm_waits_while_an_install_holds_the_lock() {
+        let paths = setup("busy");
+        pending_installed(&paths);
+        let lock = try_lock(&paths).unwrap().unwrap();
+        assert_eq!(confirm(&paths).unwrap(), Confirm::Busy);
+        assert!(paths.pending().exists());
+        assert!(paths.prev().exists());
+        drop(lock);
+        assert_eq!(
+            confirm(&paths).unwrap(),
+            Confirm::Confirmed(id("0.3.0", NEW))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_tries_a_busy_confirm_again() {
+        let paths = setup("retry");
+        pending_installed(&paths);
+        let start = on_start(&paths, &id("0.3.0", NEW), at(0));
+        let mut watch = Watch::new(paths.clone(), &start, at(0));
+        let lock = try_lock(&paths).unwrap().unwrap();
+        watch.connected();
+        // No rollback deadline after a ConnAck, only the next try.
+        let next = watch.deadline().unwrap();
+        assert_eq!(next - tokio::time::Instant::now(), CONFIRM_RETRY);
+        assert!(paths.pending().exists());
+        drop(lock);
+        tokio::time::advance(CONFIRM_RETRY).await;
+        assert!(!watch.on_deadline(), "a confirm try is not a restart");
+        assert!(!paths.pending().exists());
+        assert!(!paths.prev().exists());
+        assert_eq!(watch.deadline(), None);
+        assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "new build");
+    }
+
+    #[test]
+    fn a_json_write_leaves_no_temporary_file() {
+        let paths = setup("tmp");
+        pending_installed(&paths);
+        let names: Vec<String> = fs::read_dir(&paths.state_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["update-pending.json"]);
     }
 
     #[test]

@@ -39,7 +39,11 @@ pub fn service_start() -> (Start, Watch) {
     let now = chrono::Utc::now();
     match Paths::system() {
         Ok(paths) => {
-            let start = pending::on_start(&paths, now);
+            let running = pending::BuildId {
+                version: VERSION.to_string(),
+                commit: COMMIT.to_string(),
+            };
+            let start = pending::on_start(&paths, &running, now);
             let watch = Watch::new(paths, &start, now);
             (start, watch)
         }
@@ -67,6 +71,11 @@ pub fn log_start(start: &Start) {
             "the new build got no ConnAck: rolled back to the old binary"
         ),
         Start::RollbackFailed(e) => tracing::error!("the rollback failed: {e}"),
+        Start::Stale(new) => tracing::warn!(
+            version = %new.version,
+            commit = %new.commit,
+            "deleted the pending file of an install that stopped before the swap"
+        ),
         Start::Error(e) => tracing::warn!("update check at start: {e}"),
     }
 }

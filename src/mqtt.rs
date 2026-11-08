@@ -407,8 +407,9 @@ where
             _ = &mut stop => break Exit::Stopped,
             _ = tokio::time::sleep_until(watch.deadline().unwrap_or_else(tokio::time::Instant::now)),
                 if watch.deadline().is_some() => {
-                watch.rollback();
-                break Exit::Restart;
+                if watch.on_deadline() {
+                    break Exit::Restart;
+                }
             }
             _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)),
                 if retry_at.is_some() => retry_at = None,
