@@ -81,9 +81,12 @@ jobs:
 
       - name: Start a Mosquitto broker on 127.0.0.1:1883
         run: |
-          choco install mosquitto -y --no-progress
-          if ($LASTEXITCODE -ne 0) { throw "choco install mosquitto failed" }
-          # The package can register a mosquitto service; the job runs its own broker.
+          # Chocolatey has no mosquitto package: use the official installer (NSIS, silent).
+          $setup = Join-Path $env:RUNNER_TEMP "mosquitto-setup.exe"
+          Invoke-WebRequest -Uri "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe" -OutFile $setup
+          $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the mosquitto installer failed with $($p.ExitCode)" }
+          # The installer can register a mosquitto service; the job runs its own broker.
           Stop-Service mosquitto -ErrorAction SilentlyContinue
           $dir = "C:\Program Files\mosquitto"
           $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
