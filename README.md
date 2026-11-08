@@ -1,191 +1,128 @@
 # pc-agent
 
-Linux system agent that reports PC power, session and activity state to Home Assistant over MQTT.
+A small system agent that reports the power, session and activity state of a PC to Home Assistant
+over MQTT. It runs as a root service on Linux (systemd) and macOS (LaunchDaemon).
 
-It publishes the same MQTT discovery entities as [HASS.Agent](https://github.com/hass-agent/HASS.Agent),
-so a dual-boot PC shows as one Home Assistant device on Windows and on Linux. The target is
-Omarchy (Arch Linux, Hyprland) with an NVIDIA GPU.
+It publishes the same MQTT discovery entities as
+[HASS.Agent](https://github.com/hass-agent/HASS.Agent), so a dual-boot PC can show as one Home
+Assistant device on Windows and on Linux. The Linux target is Omarchy (Arch Linux, Hyprland) with an
+NVIDIA GPU.
 
-The agent is under construction. The repo holds the probe script below and the Cargo package.
+## Entities
 
-## Install on Linux
+| Entity | Linux | macOS | Source |
+|---|---|---|---|
+| `sessionstate` | yes | yes | Linux: logind and the Hyprland lock state. macOS: the console session. |
+| `loggedusers` | yes | yes | Logged-in local users. |
+| `lastactive` | yes | yes | Last keyboard, mouse or gamepad input. Linux: evdev. macOS: HID idle time. |
+| `lastboot` | yes | yes | Boot time. |
+| `lastsystemstatechange` | yes | yes | `ApplicationStarted`, `SessionLock`/`Unlock`, `SessionLogon`/`Logoff`, `Suspend`, `Resume`, `SystemShutdown` (Linux). |
+| `display` | yes | no | Hyprland monitor power, with the DRM `dpms` files as a fallback. |
+| `gpuload` | yes | yes | Linux: NVML. macOS: the GPU utilization of IOKit. |
+| `gpupower` | yes | no | NVML. |
 
-The Linux agent runs as a systemd service. It publishes these entities: sessionstate,
-lastactive, lastboot, lastsystemstatechange, loggedusers, display, gpuload and gpupower. Set
-`enabled = false` in the `[gpu]` section to turn off the two GPU entities.
+All messages are retained at QoS 1. The availability topic gets `online` at connect and `offline` at
+a clean stop, at sleep and at shutdown (the broker's last will covers a crash).
 
-1. Download `pc-agent-x86_64-linux.tar.gz` and its `.sha256` file from the latest release. Check
-   the archive and unpack it into a new folder:
+## Install
 
-   ```sh
-   sha256sum -c pc-agent-x86_64-linux.tar.gz.sha256
-   mkdir pc-agent
-   tar -xzf pc-agent-x86_64-linux.tar.gz -C pc-agent
-   cd pc-agent
-   ```
+Download the files from the [latest release](https://github.com/freyr/pc-agent/releases/latest).
+The pre-release `edge` holds the newest build of `main`, for testing.
 
-   In a clone of the repo the script builds the binary as your user first. You need Rust
-   (https://rustup.rs) for that way.
-
-2. Install the service:
-
-   ```sh
-   sudo scripts/install.sh
-   ```
-
-   The script installs `/usr/local/bin/pc-agent` and `/etc/systemd/system/pc-agent.service`, and
-   enables the service. It creates `/etc/pc-agent/config.toml` from the example only if the file
-   does not exist.
-
-3. Edit `/etc/pc-agent/config.toml`. Set the broker address, the user, the password and the
-   device names. The file has mode 0600 and belongs to root.
-
-   ```sh
-   sudo nano /etc/pc-agent/config.toml
-   ```
-
-4. Restart the service and read the log:
-
-   ```sh
-   sudo systemctl restart pc-agent
-   journalctl -u pc-agent -f
-   ```
-
-If a value in Home Assistant is wrong, run `sudo pc-agent diagnose`. It prints what each source
-reads (logind, Hyprland, DRM, the input devices, NVML, the sleep lock) and what the agent makes of
-it. It reads no configuration and prints no secret. Do not touch the gamepad during its 10 s
-input test.
-
-To uninstall, run the script with `--uninstall`. It stops the service and removes the unit and
-the binary. It keeps `/etc/pc-agent/config.toml`.
+### Linux (x86_64)
 
 ```sh
-sudo scripts/install.sh --uninstall
+mkdir pc-agent && cd pc-agent
+curl -LO https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-linux.tar.gz
+curl -LO https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-linux.tar.gz.sha256
+sha256sum -c pc-agent-x86_64-linux.tar.gz.sha256
+tar -xzf pc-agent-x86_64-linux.tar.gz
+sudo scripts/install.sh                 # installs the binary and the systemd unit
+sudo nano /etc/pc-agent/config.toml     # set the broker and the device (see Configuration)
+sudo systemctl restart pc-agent
+journalctl -u pc-agent -f
 ```
 
-## Probe the target PC
+If a value in Home Assistant is wrong, run `sudo pc-agent diagnose` and keep the gamepad still for
+its 10 s input test. It prints what each source reads. It reads no configuration and prints no
+secret.
 
-The probe is optional now: `sudo pc-agent diagnose` gives the same data.
+Uninstall: `sudo scripts/install.sh --uninstall` (keeps the configuration).
 
-`scripts/probe.sh` reads the signals that the agent depends on and prints them as plain text:
+### macOS (Apple silicon)
 
-- the Omarchy version and the installed packages;
-- the logind sessions;
-- the Hyprland monitor state (lock and display), read as root through the user's socket;
-- the DRM `dpms` files;
-- the NVIDIA driver, and the memory and CPU cost of NVML;
-- the input devices, and the gamepad axis limits with 10 s of readings at rest.
+1. Download `pc-agent-<version>-macos.pkg` and double-click it.
+2. The package is not signed. If macOS blocks it, open System Settings → Privacy & Security and
+   click "Open Anyway".
+3. The installer asks for the broker address, the MQTT user and password, and the device name, then
+   starts the service. An upgrade keeps the existing configuration and asks nothing.
 
-It needs bash. It uses `python3` and `jq` if they are present. The output holds user names and
-device names but no secret. Do not commit the output files (`probe-*.txt` is git-ignored).
+Log: `tail -f /var/log/pc-agent.log`. Uninstall: `sudo /usr/local/share/pc-agent/uninstall.sh`
+(add `--purge` to remove the configuration and the log too).
 
-Run it on the target PC, twice:
+Without the package: unpack `pc-agent-aarch64-macos.tar.gz`, run `sudo scripts/install-macos.sh`,
+edit `/etc/pc-agent/config.toml`, then `sudo launchctl kickstart -k system/pc-agent`.
 
-1. Get the repo:
+### From source
 
-   ```sh
-   git clone https://github.com/freyr/pc-agent.git
-   cd pc-agent
-   ```
+Install Rust (<https://rustup.rs>), clone the repo and run the install script of your OS
+(`sudo scripts/install.sh` or `sudo scripts/install-macos.sh`). The script builds the binary as your
+user, then installs it.
 
-2. Run the probe while the PC is unlocked. Do not touch the gamepad while it runs.
+## Configuration
 
-   ```sh
-   sudo bash scripts/probe.sh > probe-unlocked.txt 2>&1
-   ```
+`/etc/pc-agent/config.toml`, mode 0600, owner root. The installers create it from
+[`packaging/config.example.toml`](packaging/config.example.toml) only if it does not exist.
 
-3. Run the probe while the PC is locked. The first command asks for the password, then the probe
-   starts 20 s later in the background:
+```toml
+[mqtt]
+host = "<broker address>"
+port = 1883
+username = "<user>"
+password = "<password>"
 
-   ```sh
-   sudo -v; (sleep 20; sudo bash scripts/probe.sh > probe-locked.txt 2>&1) &
-   ```
+[device]
+name = "MyPC"                      # device name in Home Assistant and in the topics
+identifier = "pc-agent-MyPC"       # device identifier
+entity_prefix = "my_pc"            # prefix of the entity IDs
 
-   Lock the PC at once. Unlock it after 30 s.
+[gpu]
+enabled = true                     # false removes the GPU entities
+```
 
-4. Send `probe-unlocked.txt` and `probe-locked.txt` to the maintainer.
+To take over the entities of an existing HASS.Agent device, use its device name and identifier, and
+give its sensor IDs in a `[unique_ids]` section (`sessionstate`, `lastactive`, `lastboot`,
+`lastsystemstatechange`).
 
-## Install on macOS
+## Repository
 
-The macOS agent runs as a LaunchDaemon. It publishes these entities: sessionstate, lastactive,
-lastboot, lastsystemstatechange, loggedusers and gpuload. The entities display and gpupower are
-not supplied on macOS.
+| Path | Content |
+|---|---|
+| `src/core.rs`, `src/mqtt.rs`, `src/entities.rs`, `src/config.rs` | OS-neutral core: the state machine, the MQTT client, the discovery payloads, the configuration. |
+| `src/sources/linux/` | Linux sources: logind, Hyprland, DRM, evdev, NVML, the sleep lock, `diagnose`. |
+| `src/sources/macos/` | macOS sources: IOKit and the power notifications. |
+| `packaging/` | The systemd unit, the LaunchDaemon plist, the example configuration, the macOS package scripts. |
+| `scripts/install.sh`, `scripts/install-macos.sh` | Install scripts. |
+| `scripts/package.sh`, `scripts/build-pkg.sh` | Release archives and the macOS package (used by CI). |
+| `scripts/probe.sh`, `scripts/probe-macos.sh` | Signal probes from development. `pc-agent diagnose` replaces them. |
 
-### Recommended: the installer package
-
-1. Download `pc-agent-<version>-macos.pkg` from the latest release. The package is for Apple
-   silicon.
-2. Double-click the package. The package is not signed, so macOS blocks it. Open System
-   Settings, then Privacy & Security. Click "Open Anyway" for the package. Then follow the
-   installer.
-3. The installer asks for the MQTT broker address, the MQTT user, the MQTT password and the
-   device name in dialogs. It writes `/etc/pc-agent/config.toml` with mode 0600 and starts the
-   service. The last installer screen tells how to check the agent. A dialog shows only if the
-   agent did not connect to the broker within 10 s.
-4. An upgrade keeps the existing configuration. The installer asks no questions then.
-5. If nobody is logged in, or you cancel a dialog, the installer writes the example
-   configuration and does not start the service. Edit `/etc/pc-agent/config.toml`. Then run
-   `sudo launchctl bootstrap system /Library/LaunchDaemons/pc-agent.plist`.
-
-To uninstall, run `sudo /usr/local/share/pc-agent/uninstall.sh`. It keeps
-`/etc/pc-agent/config.toml`. The option `--purge` also removes `/etc/pc-agent` and the log.
-
-### Other ways
-
-Use the prebuilt archive or a clone of the repo.
-
-1. Get the files. Use one of two ways.
-
-   Download `pc-agent-aarch64-macos.tar.gz` and its `.sha256` file from a release. Then check
-   the archive and unpack it into a new folder:
-
-   ```sh
-   shasum -a 256 -c pc-agent-aarch64-macos.tar.gz.sha256
-   mkdir pc-agent
-   tar -xzf pc-agent-aarch64-macos.tar.gz -C pc-agent
-   cd pc-agent
-   ```
-
-   Or clone the repo. You need Rust (https://rustup.rs) for this way:
-
-   ```sh
-   git clone https://github.com/freyr/pc-agent.git
-   cd pc-agent
-   ```
-
-2. Install the service. In a clone, the script builds as your user first. In an unpacked
-   archive, it installs the prebuilt binary and removes the Gatekeeper quarantine flag:
-
-   ```sh
-   sudo scripts/install-macos.sh
-   ```
-
-   The script installs `/usr/local/bin/pc-agent` and `/Library/LaunchDaemons/pc-agent.plist`. It
-   creates `/etc/pc-agent/config.toml` from the example only if the file does not exist.
-
-3. Edit `/etc/pc-agent/config.toml`. Set the broker address, the user, the password and the
-   device names. The file has mode 0600 and belongs to root.
-
-   ```sh
-   sudo nano /etc/pc-agent/config.toml
-   ```
-
-4. Restart the service:
-
-   ```sh
-   sudo launchctl kickstart -k system/pc-agent
-   ```
-
-5. Check the service and read the log:
-
-   ```sh
-   sudo launchctl print system/pc-agent
-   tail -f /var/log/pc-agent.log
-   ```
-
-To uninstall, run the script with `--uninstall`. It stops the service and removes the plist and
-the binary. It keeps `/etc/pc-agent/config.toml`.
+## Development
 
 ```sh
-sudo scripts/install-macos.sh --uninstall
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
+
+The Linux code builds and tests on any OS in a container:
+`docker run --rm -v "$PWD":/src -w /src rust:1 cargo test`.
+
+`main` is protected: changes go in through pull requests. CI runs on each push and pull request for
+Linux and macOS.
+
+Releases come only from `main`:
+
+- Each push to `main` replaces the pre-release
+  [`edge`](https://github.com/freyr/pc-agent/releases/tag/edge), the bleeding-edge build.
+- A semver tag `vX.Y.Z` on a commit of `main` makes a normal release. The tag must match the
+  `version` in `Cargo.toml`.
