@@ -86,14 +86,20 @@ jobs:
           Invoke-WebRequest -Uri "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe" -OutFile $setup
           $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "the mosquitto installer failed with $($p.ExitCode)" }
-          # The installer can register a mosquitto service; the job runs its own broker.
+          # The runner ends background processes at the end of a step, so the
+          # broker runs as the mosquitto service, which reads mosquitto.conf
+          # from its install folder.
           Stop-Service mosquitto -ErrorAction SilentlyContinue
           $dir = "C:\Program Files\mosquitto"
           $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $conf = Join-Path $env:RUNNER_TEMP "mosquitto.conf"
-          "listener 1883 127.0.0.1`nallow_anonymous true`n" | Set-Content -Path $conf -Encoding ascii
-          Start-Process -FilePath "$dir\mosquitto.exe" -ArgumentList "-c", "`"$conf`"", "-v" `
-            -RedirectStandardError (Join-Path $env:RUNNER_TEMP "mosquitto.log")
+          $log = (Join-Path $env:RUNNER_TEMP "mosquitto.log") -replace '\\', '/'
+          "listener 1883 127.0.0.1`nallow_anonymous true`nlog_dest file $log`nlog_type all`n" |
+            Set-Content -Path "$dir\mosquitto.conf" -Encoding ascii
+          if (-not (Get-Service mosquitto -ErrorAction SilentlyContinue)) {
+            & "$dir\mosquitto.exe" install
+            if ($LASTEXITCODE -ne 0) { throw "mosquitto install failed" }
+          }
+          Start-Service mosquitto
           Start-Sleep -Seconds 3
           if (-not (Test-NetConnection 127.0.0.1 -Port 1883 -InformationLevel Quiet)) {
             throw "no broker on 127.0.0.1:1883"
