@@ -124,6 +124,10 @@ fn run_service() -> Result<()> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let handle = service_control_handler::register(SERVICE_NAME, handler)?;
+    handle.set_service_status(status(ServiceState::Running, ACCEPTED, 0))?;
+    // Register only after POWER_EVENT is accepted: the SCM drops a power
+    // event before that, and Windows sends the current display state at
+    // registration.
     // SAFETY: the status handle stays valid while the service runs; the
     // registration ends with the process.
     if let Err(e) = unsafe {
@@ -135,7 +139,6 @@ fn run_service() -> Result<()> {
     } {
         warn!("no display state: RegisterPowerSettingNotification failed: {e}");
     }
-    handle.set_service_status(status(ServiceState::Running, ACCEPTED, 0))?;
 
     let config = CONFIG
         .get()

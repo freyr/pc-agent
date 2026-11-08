@@ -37,7 +37,10 @@ pub fn logged_users() -> Option<Vec<String>> {
         .collect();
     // SAFETY: `list` came from WTSEnumerateSessionsW and is not used after this.
     unsafe { WTSFreeMemory(list.cast()) };
-    let sessions: Vec<WtsSession> = ids.into_iter().filter_map(session).collect();
+    // A failed read of one session fails the whole list: dropping that user
+    // would give a false SessionLogoff and then a false SessionLogon. The
+    // last list stays until the next poll.
+    let sessions: Vec<WtsSession> = ids.into_iter().map(session).collect::<Option<_>>()?;
     Some(wts_rules::logged_users(&sessions))
 }
 

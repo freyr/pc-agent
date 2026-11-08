@@ -194,9 +194,14 @@ jobs:
           "gpuload read exit code: $LASTEXITCODE"
           if ($gpu) { throw "unexpected gpuload state '$gpu'" }
           # The NVML init fails once and is retried after 5 min: one warning.
-          $warnings = @(Select-String -Path C:\ProgramData\pc-agent\pc-agent.log -SimpleMatch 'NVML')
+          # Exactly one: zero would mean that the failure path did not run.
+          foreach ($i in 1..15) {
+            $warnings = @(Select-String -Path C:\ProgramData\pc-agent\pc-agent.log -SimpleMatch 'NVML init failed')
+            if ($warnings.Count -ge 1) { break }
+            Start-Sleep -Seconds 1
+          }
           $warnings | ForEach-Object { $_.Line }
-          if ($warnings.Count -gt 1) { throw "expected at most one NVML warning, got $($warnings.Count)" }
+          if ($warnings.Count -ne 1) { throw "expected exactly one NVML init warning, got $($warnings.Count)" }
           $global:LASTEXITCODE = 0
 
       - name: Uninstall the service
