@@ -182,6 +182,21 @@ pub struct InputCaps {
     pub gamepad: bool,
     /// The absinfo of each absolute axis of the device, by axis code.
     pub axes: std::collections::HashMap<u16, AxisInfo>,
+    /// A gamepad with no `ABS_RX` and no `ABS_RY`: `ABS_Z` and `ABS_RZ` are
+    /// its right stick.
+    pub z_is_stick: bool,
+}
+
+impl InputCaps {
+    /// The capabilities from the gamepad flag and the absinfo of the axes.
+    pub fn new(gamepad: bool, axes: std::collections::HashMap<u16, AxisInfo>) -> Self {
+        let z_is_stick = gamepad && !axes.contains_key(&ABS_RX) && !axes.contains_key(&ABS_RY);
+        InputCaps {
+            gamepad,
+            axes,
+            z_is_stick,
+        }
+    }
 }
 
 /// `true` when one of the key codes makes the device a gamepad.
@@ -209,10 +224,9 @@ pub fn is_activity(caps: &InputCaps, kind: u16, code: u16, value: i32) -> bool {
                 i64::from(a.flat),
             );
             let range = max - min;
-            let z_is_stick = !caps.axes.contains_key(&ABS_RX) && !caps.axes.contains_key(&ABS_RY);
             let stick = STICK_AXES.contains(&code)
                 || HAT_AXES.contains(&code)
-                || (z_is_stick && Z_AXES.contains(&code));
+                || (caps.z_is_stick && Z_AXES.contains(&code));
             if stick {
                 // |v - center| > max(flat, range / 10)
                 10 * (2 * v - (min + max)).abs() > 2 * (10 * flat).max(range)
@@ -599,10 +613,17 @@ mod tests {
     }
 
     fn pad(axes: &[(u16, AxisInfo)]) -> InputCaps {
-        InputCaps {
-            gamepad: true,
-            axes: axes.iter().copied().collect(),
-        }
+        InputCaps::new(true, axes.iter().copied().collect())
+    }
+
+    #[test]
+    fn z_is_stick_is_set_at_open() {
+        assert!(dinput().z_is_stick);
+        assert!(!xbox().z_is_stick);
+        assert!(!dualsense().z_is_stick);
+        // Only a gamepad has its right stick on Z and RZ.
+        let tablet = InputCaps::new(false, [(ABS_Z, axis(0, 255, 0))].into_iter().collect());
+        assert!(!tablet.z_is_stick);
     }
 
     /// Sticks -32768..32767 flat 128 (left) and 4095 (right), triggers
@@ -789,10 +810,7 @@ mod tests {
 
     #[test]
     fn abs_on_a_touchpad_counts() {
-        let touchpad = InputCaps {
-            gamepad: false,
-            axes: [(ABS_X, axis(0, 1216, 0))].into_iter().collect(),
-        };
+        let touchpad = InputCaps::new(false, [(ABS_X, axis(0, 1216, 0))].into_iter().collect());
         assert!(is_activity(&touchpad, EV_ABS, ABS_X, 600));
         assert!(is_activity(&touchpad, EV_ABS, ABS_X, 0));
     }

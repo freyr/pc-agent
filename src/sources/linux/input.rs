@@ -102,7 +102,7 @@ fn caps(device: &Device) -> InputCaps {
             .collect(),
         Err(_) => Default::default(),
     };
-    InputCaps { gamepad, axes }
+    InputCaps::new(gamepad, axes)
 }
 
 /// Starts the stream task of one device, unless it is an accelerometer.

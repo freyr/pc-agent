@@ -46,7 +46,12 @@ pub struct Device {
 
 #[derive(Debug, Deserialize)]
 pub struct Gpu {
+    #[serde(default = "enabled_default")]
     pub enabled: bool,
+}
+
+fn enabled_default() -> bool {
+    true
 }
 
 // The `[gpu]` section is optional; the GPU is on when it is absent.
@@ -147,6 +152,13 @@ enabled = true
     #[test]
     fn gpu_section_is_optional_and_on_by_default() {
         let text = FULL.replace("[gpu]\nenabled = true\n", "");
+        let c = Config::parse(&text).unwrap();
+        assert!(c.gpu.enabled);
+    }
+
+    #[test]
+    fn a_gpu_section_without_the_key_is_on() {
+        let text = FULL.replace("[gpu]\nenabled = true\n", "[gpu]\n");
         let c = Config::parse(&text).unwrap();
         assert!(c.gpu.enabled);
     }
