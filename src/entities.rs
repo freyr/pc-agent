@@ -98,9 +98,8 @@ pub const DISPLAY: Entity = Entity {
     ..sensor("display", "mdi:monitor")
 };
 
-/// The entity table of the spec.
-// Read by the tests; the agent publishes the entities that the source supplies.
-#[allow(dead_code)]
+/// The entity table of the spec. The agent publishes the configs of the
+/// entities that the source supplies and empty configs for the rest.
 pub const ENTITIES: [Entity; 8] = [
     SESSIONSTATE,
     LASTACTIVE,
