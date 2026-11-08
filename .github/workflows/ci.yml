@@ -154,6 +154,8 @@ jobs:
           $offline = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/availability' -C 1 -W 20
           "availability: $offline"
           if ($offline -ne 'offline') { throw "expected offline after the stop, got '$offline'" }
+          # The last will also gives offline; the log line proves the clean stop.
+          if (-not (Select-String -Path C:\ProgramData\pc-agent\pc-agent.log -SimpleMatch 'offline acknowledged' -Quiet)) { throw "no clean stop: 'offline acknowledged' is not in the log" }
           # 1060: the service does not exist.
           $gone = $false
           foreach ($i in 1..10) {
