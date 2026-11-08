@@ -61,8 +61,18 @@ pub async fn run(config: Option<&Path>) {
     let powercfg = std::process::Command::new("powercfg")
         .arg("/a")
         .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .map_err(|e| e.to_string());
+        .map_err(|e| e.to_string())
+        .and_then(|out| {
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            } else {
+                Err(format!(
+                    "{}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        });
     print!("{}", fmt::format_powercfg(&powercfg));
 
     println!("== Smart App Control");
@@ -88,11 +98,9 @@ async fn check_mqtt(path: &Path) -> MqttOutcome {
     if !path.exists() {
         return MqttOutcome::NoConfig(path.display().to_string());
     }
-    // Only the top error: the toml cause can quote a line of the file,
-    // and that line can hold the password.
     let cfg = match Config::load(path) {
         Ok(cfg) => cfg,
-        Err(e) => return MqttOutcome::BadConfig(e.to_string()),
+        Err(e) => return MqttOutcome::BadConfig(config_error(&e)),
     };
     let opts = mqtt::diagnose_options(&cfg);
     let client_id = opts.client_id();
@@ -127,4 +135,18 @@ async fn check_mqtt(path: &Path) -> MqttOutcome {
         port,
         client_id,
     }
+}
+
+/// The error of a config load with its cause, but never the toml source
+/// snippet: the quoted line can hold the password.
+fn config_error(e: &anyhow::Error) -> String {
+    let mut text = e.to_string();
+    for cause in e.chain().skip(1) {
+        if let Some(toml) = cause.downcast_ref::<toml::de::Error>() {
+            text.push_str(&format!(": {}", toml.message()));
+        } else {
+            text.push_str(&format!(": {cause}"));
+        }
+    }
+    text
 }

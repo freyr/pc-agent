@@ -289,7 +289,11 @@ jobs:
           @"
           @echo off
           $exe diagnose --config $dir\config.toml > $out 2>&1
-          echo exit code %ERRORLEVEL% >> $out
+          set rc=%ERRORLEVEL%
+          rem Only SYSTEM can read the log of the mosquitto service: copy it
+          rem to a folder that Administrators can read, before the end marker.
+          copy /y "$($env:RUNNER_TEMP)\mosquitto.log" "$dir\mosquitto-copy.log" > nul
+          echo exit code %rc% >> $out
           "@ | Set-Content -Path "$dir\diagnose.cmd" -Encoding ascii
           schtasks /Create /TN pcagent-diag /RU SYSTEM /SC ONCE /ST 00:00 /F /TR "$dir\diagnose.cmd"
           if ($LASTEXITCODE -ne 0) { throw "schtasks /Create failed" }
@@ -314,11 +318,9 @@ jobs:
           $availability = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/availability' 20
           "availability: $availability"
           if ($availability -ne 'offline') { throw "diagnose changed the availability to '$availability'" }
-          $log = Join-Path $env:RUNNER_TEMP "mosquitto.log"
-          # The mosquitto service keeps its log open: read it with shared access.
-          $stream = [System.IO.File]::Open($log, 'Open', 'Read', 'ReadWrite')
-          try { $text = (New-Object System.IO.StreamReader($stream)).ReadToEnd() } finally { $stream.Dispose() }
-          $lines = @($text -split "`r?`n" | Where-Object { $_.Contains('pc-agent-diagnose-CI-TEST') })
+          # The copy that the SYSTEM task made of the broker log.
+          $log = Get-Content "$dir\mosquitto-copy.log" -Raw
+          $lines = @($log -split "`r?`n" | Where-Object { $_.Contains('pc-agent-diagnose-CI-TEST') })
           $lines
           if ($lines.Count -eq 0) { throw "the broker log has no connect of pc-agent-diagnose-CI-TEST" }
           if ($lines | Where-Object { $_ -match 'PUBLISH from pc-agent-diagnose' }) { throw "diagnose published a message" }

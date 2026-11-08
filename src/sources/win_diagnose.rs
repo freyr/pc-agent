@@ -84,12 +84,14 @@ pub type NvmlDevice = (String, u32, Result<f64, String>);
 
 /// The NVML check: the library that opened and the device 0 read, or the
 /// error of each library.
-pub fn format_nvml(result: &Result<(&str, Result<NvmlDevice, String>), String>) -> String {
+pub fn format_nvml<S: AsRef<str>>(
+    result: &Result<(S, Result<NvmlDevice, String>), String>,
+) -> String {
     let (lib, device) = match result {
         Ok(found) => found,
         Err(e) => return format!("  not available: {e}\n"),
     };
-    let mut out = format!("  loaded {lib}\n");
+    let mut out = format!("  loaded {}\n", lib.as_ref());
     match device {
         Ok((name, load, power)) => {
             let _ = writeln!(out, "  device 0 {name:?}  utilization {load} %");
@@ -365,7 +367,7 @@ mod tests {
             "  loaded nvml.dll\n  device 0 not available: GPU is lost\n"
         );
         assert_eq!(
-            format_nvml(&Err("nvml.dll: a; x.dll: b".to_string())),
+            format_nvml::<&str>(&Err("nvml.dll: a; x.dll: b".to_string())),
             "  not available: nvml.dll: a; x.dll: b\n"
         );
     }

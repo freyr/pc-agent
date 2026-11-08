@@ -48,15 +48,29 @@ pub fn check() -> Result<(String, u32, Result<f64, String>), String> {
 /// For `diagnose` on Windows: the library that opened and one query of
 /// GPU 0, or the error of each library.
 #[cfg(windows)]
-pub fn check() -> Result<
-    (
-        &'static str,
-        Result<super::win_diagnose::NvmlDevice, String>,
-    ),
-    String,
-> {
+pub fn check() -> Result<(String, Result<super::win_diagnose::NvmlDevice, String>), String> {
     let (nvml, lib) = open_first(&WINDOWS_LIBS, open_windows)?;
-    Ok((lib, device_check(&nvml)))
+    Ok((module_path(lib), device_check(&nvml)))
+}
+
+/// The full path of the loaded `nvml.dll` (a load by name searches the
+/// path), or `lib` when Windows does not give it.
+#[cfg(windows)]
+fn module_path(lib: &str) -> String {
+    use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+    use windows::core::w;
+    // SAFETY: a static wide string; the buffer length is passed by the slice.
+    unsafe {
+        let Ok(module) = GetModuleHandleW(w!("nvml.dll")) else {
+            return lib.to_string();
+        };
+        let mut buf = [0u16; 1024];
+        let len = GetModuleFileNameW(Some(module), &mut buf) as usize;
+        if len == 0 || len >= buf.len() {
+            return lib.to_string();
+        }
+        String::from_utf16_lossy(&buf[..len])
+    }
 }
 
 /// The name of GPU 0 and one query of it.
