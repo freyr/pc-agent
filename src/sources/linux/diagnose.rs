@@ -6,9 +6,10 @@ use std::fmt::Write;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
+use super::super::nvml;
 use super::input::{self, DeviceInfo};
 use super::rules::{self, AxisRole, Connector, LockTracker, Monitor, Session};
-use super::{drm, gpu, hyprland, logind, os};
+use super::{drm, hyprland, logind, os};
 use crate::core::SessionState;
 use crate::time::format_timestamp;
 
@@ -232,7 +233,7 @@ pub async fn run() {
     }
 
     println!("== NVML");
-    match gpu::check() {
+    match nvml::check() {
         Ok((name, load, power)) => {
             println!("  device 0 {name:?}  utilization {load} %");
             match power {

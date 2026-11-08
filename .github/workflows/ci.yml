@@ -58,9 +58,11 @@ jobs:
           if-no-files-found: error
 
   # The runner has no interactive session and no NVIDIA GPU. The job installs
-  # the service, runs it against a local broker and removes it.
+  # the service, runs it against a local broker and removes it. The GPU is on
+  # in the test configuration, so the NVML failure path runs.
   windows:
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         shell: pwsh
@@ -79,11 +81,28 @@ jobs:
           path: target/release/pc-agent.exe
           if-no-files-found: error
 
+      - name: Restore the Mosquitto installer from the cache
+        id: mosquitto-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/mosquitto-2.0.22-install-windows-x64.exe
+          key: mosquitto-2.0.22-install-windows-x64
+
+      - name: Download the Mosquitto installer
+        if: steps.mosquitto-cache.outputs.cache-hit != 'true'
+        run: |
+          # Chocolatey has no mosquitto package: use the official installer.
+          # mosquitto.org sometimes drops the connection ("unexpected EOF"),
+          # and Invoke-WebRequest does not retry that, so use curl.
+          curl.exe --fail --location --retry 8 --retry-all-errors --retry-delay 5 `
+            --output "$HOME\mosquitto-2.0.22-install-windows-x64.exe" `
+            "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "the Mosquitto download failed" }
+
       - name: Start a Mosquitto broker on 127.0.0.1:1883
         run: |
-          # Chocolatey has no mosquitto package: use the official installer (NSIS, silent).
-          $setup = Join-Path $env:RUNNER_TEMP "mosquitto-setup.exe"
-          Invoke-WebRequest -Uri "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe" -OutFile $setup -MaximumRetryCount 5 -RetryIntervalSec 10
+          # The official installer (NSIS, silent).
+          $setup = "$HOME\mosquitto-2.0.22-install-windows-x64.exe"
           $p = Start-Process -FilePath $setup -ArgumentList "/S" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "the mosquitto installer failed with $($p.ExitCode)" }
           # The runner ends background processes at the end of a step, so the
@@ -104,6 +123,18 @@ jobs:
           if (-not (Test-NetConnection 127.0.0.1 -Port 1883 -InformationLevel Quiet)) {
             throw "no broker on 127.0.0.1:1883"
           }
+          # mosquitto_sub on Windows ignores -W (no SIGALRM), so this helper
+          # ends the read itself and returns nothing after the timeout.
+          $read = Join-Path $env:RUNNER_TEMP "mqtt-read.ps1"
+          @'
+          param([string]$Topic, [int]$Seconds = 20)
+          $out = Join-Path $env:RUNNER_TEMP ("mqtt-" + [guid]::NewGuid() + ".txt")
+          $p = Start-Process -FilePath mosquitto_sub -NoNewWindow -PassThru `
+            -ArgumentList "-h", "127.0.0.1", "-t", $Topic, "-C", "1" -RedirectStandardOutput $out
+          if (-not $p.WaitForExit($Seconds * 1000)) { $p.Kill(); $p.WaitForExit() }
+          if (Test-Path $out) { $v = Get-Content $out -Raw; if ($v) { $v.TrimEnd("`r", "`n") } }
+          '@ | Set-Content -Path $read -Encoding utf8
+          "MQTT_READ=$read" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install the service with a test configuration
         run: |
@@ -121,7 +152,7 @@ jobs:
           entity_prefix = "ci_test"
 
           [gpu]
-          enabled = false
+          enabled = true
           "@ | Set-Content -Path $cfg -Encoding utf8
           .\target\release\pc-agent.exe install --config $cfg
           if ($LASTEXITCODE -ne 0) { throw "pc-agent install failed" }
@@ -145,22 +176,52 @@ jobs:
           $query = sc.exe query pc-agent
           $query
           if (-not ($query -match 'RUNNING')) { throw "pc-agent is not RUNNING" }
-          $online = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/availability' -C 1 -W 20
+          $online = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/availability' 20
           "availability: $online"
           if ($online -ne 'online') { throw "expected online, got '$online'" }
-          $boot = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/lastboot/state' -C 1 -W 20
+          $boot = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/lastboot/state' 20
           "lastboot: $boot"
           if ($boot -notmatch '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z$') { throw "bad lastboot '$boot'" }
-          $config = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/lastboot/config' -C 1 -W 20
+          $config = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/lastboot/config' 20
           "lastboot config: $config"
           if (($config | ConvertFrom-Json).name -ne 'lastboot') { throw "bad lastboot config" }
+
+      - name: Read the session states and check that no GPU is published
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $base = 'homeassistant/sensor/CI-TEST'
+          # No console user on the runner: Unknown. Accept a console session too.
+          $session = & $env:MQTT_READ "$base/sessionstate/state" 20
+          "sessionstate: $session"
+          if ($session -notin @('Unknown', 'Unlocked', 'Locked')) { throw "bad sessionstate '$session'" }
+          if ($session -ne 'Unknown') { "note: the runner has a console session ($session)" }
+          $users = & $env:MQTT_READ "$base/loggedusers/state" 20
+          "loggedusers: $users"
+          if ($users -notmatch '^\[.*\]$') { throw "bad loggedusers '$users'" }
+          $display = & $env:MQTT_READ 'homeassistant/binary_sensor/CI-TEST/display/state' 5
+          "display (none before the first notification): '$display'"
+          $gpuconfig = & $env:MQTT_READ "$base/gpuload/config" 20
+          if (($gpuconfig | ConvertFrom-Json).name -ne 'gpuload') { throw "no gpuload config: the GPU is not supplied" }
+          # No NVIDIA GPU: no gpuload state, so the read must time out.
+          $gpu = & $env:MQTT_READ "$base/gpuload/state" 10
+          if ($gpu) { throw "unexpected gpuload state '$gpu'" }
+          # The NVML init fails once and is retried after 5 min: one warning.
+          # Exactly one: zero would mean that the failure path did not run.
+          foreach ($i in 1..15) {
+            $warnings = @(Select-String -Path C:\ProgramData\pc-agent\pc-agent.log -SimpleMatch 'NVML init failed')
+            if ($warnings.Count -ge 1) { break }
+            Start-Sleep -Seconds 1
+          }
+          $warnings | ForEach-Object { $_.Line }
+          if ($warnings.Count -ne 1) { throw "expected exactly one NVML init warning, got $($warnings.Count)" }
+          $global:LASTEXITCODE = 0
 
       - name: Uninstall the service
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           .\target\release\pc-agent.exe uninstall
           if ($LASTEXITCODE -ne 0) { throw "pc-agent uninstall failed" }
-          $offline = mosquitto_sub -h 127.0.0.1 -t 'homeassistant/sensor/CI-TEST/availability' -C 1 -W 20
+          $offline = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/availability' 20
           "availability: $offline"
           if ($offline -ne 'offline') { throw "expected offline after the stop, got '$offline'" }
           # The last will also gives offline; the log line proves the clean stop.

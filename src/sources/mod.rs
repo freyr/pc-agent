@@ -15,6 +15,12 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 
+#[cfg(any(target_os = "linux", windows))]
+mod nvml;
+
+#[cfg(any(windows, test))]
+mod wts_rules;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

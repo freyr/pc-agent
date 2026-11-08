@@ -1,15 +1,17 @@
-//! The Windows sources and the service frame. The source supplies `lastboot`
-//! only; the later tasks add the session, power, display, GPU and helper
-//! sources.
+//! The Windows sources and the service frame. The service reads the boot
+//! time, the console session, the session list, the display state and the
+//! GPU; the later tasks add the power events and the helper sources.
 
 mod install;
 mod service;
+mod wts;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::windows::Win32::System::SystemInformation::GetTickCount64;
 use tokio::sync::mpsc;
 
+use super::wts_rules::DisplayCell;
 use crate::core::{Snapshot, SystemEvent};
 use crate::entities::{self, Entity};
 
@@ -22,11 +24,30 @@ const DATA_DIR: &str = r"C:\ProgramData\pc-agent";
 /// The name of the Windows service.
 const SERVICE_NAME: &str = "pc-agent";
 
-/// The entities that the Windows sources supply.
-static SUPPLIED: [&Entity; 1] = [&entities::LASTBOOT];
+/// The entities that the Windows sources supply with the GPU on.
+static SUPPLIED: [&Entity; 6] = [
+    &entities::LASTBOOT,
+    &entities::SESSIONSTATE,
+    &entities::LOGGEDUSERS,
+    &entities::DISPLAY,
+    &entities::GPULOAD,
+    &entities::GPUPOWER,
+];
 
-pub fn supplied(_gpu: bool) -> &'static [&'static Entity] {
-    &SUPPLIED
+/// The entities with the GPU off (`[gpu] enabled = false`).
+static SUPPLIED_NO_GPU: [&Entity; 4] = [
+    &entities::LASTBOOT,
+    &entities::SESSIONSTATE,
+    &entities::LOGGEDUSERS,
+    &entities::DISPLAY,
+];
+
+/// The last console display state: the service control handler records each
+/// `GUID_CONSOLE_DISPLAY_STATE` notification, the poll reads it.
+static DISPLAY: DisplayCell = DisplayCell::new();
+
+pub fn supplied(gpu: bool) -> &'static [&'static Entity] {
+    if gpu { &SUPPLIED } else { &SUPPLIED_NO_GPU }
 }
 
 /// The device model.
@@ -43,9 +64,16 @@ pub fn boot_time() -> Option<i64> {
     Some(now - (up_ms / 1000) as i64)
 }
 
-/// One snapshot: no Windows source reads a polled entity yet.
-pub fn poll(_gpu: bool) -> Snapshot {
-    Snapshot::default()
+/// One snapshot: the console session, the session list, the last display
+/// notification (none before the first) and, with `gpu`, the NVML sample.
+pub fn poll(gpu: bool) -> Snapshot {
+    Snapshot {
+        session: wts::console_state(),
+        users: wts::logged_users(),
+        display: DISPLAY.get(),
+        gpu: if gpu { super::nvml::sample() } else { None },
+        ..Snapshot::default()
+    }
 }
 
 /// `pc-agent diagnose`: the checks are for Linux only.
@@ -64,12 +92,27 @@ pub fn events() -> mpsc::Receiver<SystemEvent> {
 mod tests {
     use super::*;
 
+    fn names(gpu: bool) -> Vec<&'static str> {
+        supplied(gpu).iter().map(|e| e.name).collect()
+    }
+
     #[test]
-    fn windows_supplies_lastboot_only() {
-        for gpu in [true, false] {
-            let names: Vec<&str> = supplied(gpu).iter().map(|e| e.name).collect();
-            assert_eq!(names, ["lastboot"]);
-        }
+    fn windows_supplies_the_service_entities() {
+        assert_eq!(
+            names(true),
+            [
+                "lastboot",
+                "sessionstate",
+                "loggedusers",
+                "display",
+                "gpuload",
+                "gpupower"
+            ]
+        );
+        assert_eq!(
+            names(false),
+            ["lastboot", "sessionstate", "loggedusers", "display"]
+        );
     }
 
     #[test]

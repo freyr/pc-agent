@@ -3,7 +3,6 @@
 mod boot;
 mod diagnose;
 mod drm;
-mod gpu;
 mod hyprland;
 mod input;
 mod logind;
@@ -75,7 +74,7 @@ pub fn boot_time() -> Option<i64> {
 pub fn poll(gpu: bool) -> Snapshot {
     Snapshot {
         last_input: input::last_input(),
-        gpu: if gpu { gpu::sample() } else { None },
+        gpu: if gpu { super::nvml::sample() } else { None },
         ..snapshot(
             logind::sessions(),
             Path::new(hyprland::RUN_USER),
