@@ -8,7 +8,64 @@ Omarchy (Arch Linux, Hyprland) with an NVIDIA GPU.
 
 The agent is under construction. The repo holds the probe script below and the Cargo package.
 
+## Install on Linux
+
+The Linux agent runs as a systemd service. It publishes these entities: sessionstate,
+lastactive, lastboot, lastsystemstatechange, loggedusers, display, gpuload and gpupower. Set
+`enabled = false` in the `[gpu]` section to turn off the two GPU entities.
+
+1. Download `pc-agent-x86_64-linux.tar.gz` and its `.sha256` file from the latest release. Check
+   the archive and unpack it into a new folder:
+
+   ```sh
+   sha256sum -c pc-agent-x86_64-linux.tar.gz.sha256
+   mkdir pc-agent
+   tar -xzf pc-agent-x86_64-linux.tar.gz -C pc-agent
+   cd pc-agent
+   ```
+
+   In a clone of the repo the script builds the binary as your user first. You need Rust
+   (https://rustup.rs) for that way.
+
+2. Install the service:
+
+   ```sh
+   sudo scripts/install.sh
+   ```
+
+   The script installs `/usr/local/bin/pc-agent` and `/etc/systemd/system/pc-agent.service`, and
+   enables the service. It creates `/etc/pc-agent/config.toml` from the example only if the file
+   does not exist.
+
+3. Edit `/etc/pc-agent/config.toml`. Set the broker address, the user, the password and the
+   device names. The file has mode 0600 and belongs to root.
+
+   ```sh
+   sudo nano /etc/pc-agent/config.toml
+   ```
+
+4. Restart the service and read the log:
+
+   ```sh
+   sudo systemctl restart pc-agent
+   journalctl -u pc-agent -f
+   ```
+
+If a value in Home Assistant is wrong, run `sudo pc-agent diagnose`. It prints what each source
+reads (logind, Hyprland, DRM, the input devices, NVML, the sleep lock) and what the agent makes of
+it. It reads no configuration and prints no secret. Do not touch the gamepad during its 10 s
+input test.
+
+To uninstall, run the script with `--uninstall`. It stops the service and removes the unit and
+the binary. It keeps `/etc/pc-agent/config.toml`.
+
+```sh
+sudo scripts/install.sh --uninstall
+```
+
 ## Probe the target PC
+
+The probe is optional now: `sudo pc-agent diagnose` gives the same data.
 
 `scripts/probe.sh` reads the signals that the agent depends on and prints them as plain text:
 

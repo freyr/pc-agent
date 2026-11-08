@@ -1,0 +1,16 @@
+[Unit]
+Description=pc-agent: publishes the state of this PC to Home Assistant over MQTT
+After=network-online.target dbus.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/pc-agent
+Restart=always
+RestartSec=5
+TimeoutStopSec=4
+Environment=MALLOC_ARENA_MAX=2
+
+[Install]
+WantedBy=multi-user.target

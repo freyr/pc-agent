@@ -8,7 +8,8 @@
 # Writes two files to <output-dir>:
 #   pc-agent-<target>.tar.gz         (pc-agent, README.md and packaging/config.example.toml;
 #                                     on macOS also packaging/pc-agent.plist and
-#                                     scripts/install-macos.sh)
+#                                     scripts/install-macos.sh; on Linux also
+#                                     packaging/pc-agent.service and scripts/install.sh)
 #   pc-agent-<target>.tar.gz.sha256  (checkable with sha256sum -c or shasum -a 256 -c)
 
 set -euo pipefail
@@ -48,6 +49,12 @@ if [[ "$os" == "Darwin" ]]; then
   mkdir "$stage/scripts"
   install -m 0755 "$root/scripts/install-macos.sh" "$stage/scripts/install-macos.sh"
   files+=(scripts/install-macos.sh)
+else
+  install -m 0644 "$root/packaging/pc-agent.service" "$stage/packaging/pc-agent.service"
+  files+=(packaging/pc-agent.service)
+  mkdir "$stage/scripts"
+  install -m 0755 "$root/scripts/install.sh" "$stage/scripts/install.sh"
+  files+=(scripts/install.sh)
 fi
 
 tar -C "$stage" -czf "$out/$name" "${files[@]}"
