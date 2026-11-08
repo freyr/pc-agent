@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::update::Channel;
+
 #[cfg(not(windows))]
 pub const DEFAULT_PATH: &str = "/etc/pc-agent/config.toml";
 #[cfg(windows)]
@@ -18,6 +20,9 @@ pub struct Config {
     pub unique_ids: HashMap<String, String>,
     #[serde(default)]
     pub gpu: Gpu,
+    #[serde(default)]
+    #[allow(dead_code)] // The schedule (U4) reads it.
+    pub update: Update,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +66,39 @@ fn enabled_default() -> bool {
 impl Default for Gpu {
     fn default() -> Self {
         Gpu { enabled: true }
+    }
+}
+
+/// The optional `[update]` section: `auto` (default true) and `channel`
+/// (default stable).
+#[derive(Debug, Deserialize)]
+pub struct Update {
+    #[serde(default = "enabled_default")]
+    #[allow(dead_code)] // The schedule (U4) reads it.
+    pub auto: bool,
+    #[serde(default)]
+    pub channel: Channel,
+}
+
+impl Default for Update {
+    fn default() -> Self {
+        Update {
+            auto: true,
+            channel: Channel::default(),
+        }
+    }
+}
+
+impl Update {
+    /// The `[update]` section of a config file. The other sections are not
+    /// read, so `pc-agent update --check` works with an incomplete file.
+    pub fn parse_section(text: &str) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct OnlyUpdate {
+            #[serde(default)]
+            update: Update,
+        }
+        Ok(toml::from_str::<OnlyUpdate>(text)?.update)
     }
 }
 
@@ -171,6 +209,43 @@ enabled = true
         let text = FULL.replace("[gpu]\nenabled = true\n", "[gpu]\nenabled = false\n");
         let c = Config::parse(&text).unwrap();
         assert!(!c.gpu.enabled);
+    }
+
+    #[test]
+    fn update_section_is_optional_with_auto_on_and_stable() {
+        let c = Config::parse(FULL).unwrap();
+        assert!(c.update.auto);
+        assert_eq!(c.update.channel, Channel::Stable);
+        let c = Config::parse(&format!("{FULL}\n[update]\n")).unwrap();
+        assert!(c.update.auto);
+        assert_eq!(c.update.channel, Channel::Stable);
+    }
+
+    #[test]
+    fn update_can_use_edge_and_turn_auto_off() {
+        let c = Config::parse(&format!(
+            "{FULL}\n[update]\nauto = false\nchannel = \"edge\"\n"
+        ))
+        .unwrap();
+        assert!(!c.update.auto);
+        assert_eq!(c.update.channel, Channel::Edge);
+    }
+
+    #[test]
+    fn an_unknown_channel_is_an_error() {
+        let text = format!("{FULL}\n[update]\nchannel = \"beta\"\n");
+        assert!(Config::parse(&text).is_err());
+        assert!(Update::parse_section(&text).is_err());
+    }
+
+    #[test]
+    fn the_update_section_reads_without_the_other_sections() {
+        let u = Update::parse_section("[update]\nchannel = \"edge\"\n").unwrap();
+        assert_eq!(u.channel, Channel::Edge);
+        assert!(u.auto);
+        let u = Update::parse_section(FULL).unwrap();
+        assert_eq!(u.channel, Channel::Stable);
+        assert!(Update::parse_section("not toml [").is_err());
     }
 
     #[test]

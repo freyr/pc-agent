@@ -26,6 +26,10 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q minisign
           bash scripts/check-manifest.sh dist
+      # The real edge release, signed with the project key; the check must
+      # print its commit, whether this build is newer, older or the same.
+      - name: Check the edge release with update --check
+        run: bash scripts/check-edge.sh target/release/pc-agent
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-x86_64-linux
@@ -50,6 +54,10 @@ jobs:
         run: |
           brew install minisign
           bash scripts/check-manifest.sh dist
+      # The real edge release, signed with the project key; the check must
+      # print its commit, whether this build is newer, older or the same.
+      - name: Check the edge release with update --check
+        run: bash scripts/check-edge.sh target/release/pc-agent
       - uses: actions/upload-artifact@v7
         with:
           name: pc-agent-aarch64-macos
@@ -107,6 +115,33 @@ jobs:
           [IO.File]::WriteAllText($changed, $text)
           & $exe update --verify $changed "$data\manifest.json.minisig" "$data\test.pub"
           if ($LASTEXITCODE -eq 0) { throw "a changed manifest verified" }
+          $global:LASTEXITCODE = 0
+      # The real edge release, signed with the project key; the check must
+      # print its commit, whether this build is newer, older or the same.
+      # The release workflow of the same push can replace edge meanwhile, so
+      # it tries again (as scripts/check-edge.sh does).
+      - name: Check the edge release with update --check
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $url = 'https://github.com/freyr/pc-agent/releases/download/edge/manifest.json'
+          $ok = $false
+          foreach ($i in 1..5) {
+            "== attempt $i"
+            $out = @(.\target\release\pc-agent.exe update --check --channel edge 2>&1 | ForEach-Object { "$_" })
+            $code = $LASTEXITCODE
+            $out
+            if ($code -eq 0) {
+              $expected = (curl.exe -fsSL $url | ConvertFrom-Json).commit
+              if ($expected -and ($out -match "^manifest: .* commit $expected ")) {
+                "OK: the check prints the edge commit $expected"
+                $ok = $true
+                break
+              }
+              "the output does not have the edge commit '$expected'"
+            }
+            Start-Sleep -Seconds 30
+          }
+          if (-not $ok) { throw "update --check --channel edge failed" }
           $global:LASTEXITCODE = 0
       - uses: actions/upload-artifact@v7
         with:
