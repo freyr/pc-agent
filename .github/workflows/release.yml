@@ -126,9 +126,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # The manifest goes to signed/, not dist/, so the release steps upload
-      # it after all other assets: a client never sees a manifest whose
-      # assets are missing.
+      # The manifest goes to signed/, not dist/. Each release is made as a
+      # draft with all assets and published after that, so a client never
+      # sees a manifest whose assets are missing.
       - name: Write and sign the manifest
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -143,21 +143,34 @@ jobs:
           bash scripts/manifest.sh dist > signed/manifest.json
           cat signed/manifest.json
           key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
           (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
           minisign -S -s "$key" -m signed/manifest.json -x signed/manifest.json.minisig
-          rm -f "$key"
+          # The agents check the manifest with the key in src/update/key.rs:
+          # a secret that does not match it stops the release here, before
+          # edge is deleted.
+          pub="$(sed -n 's/^pub const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' src/update/key.rs)"
+          if [[ -z "$pub" ]]; then
+            echo "::error::No PUBLIC_KEY in src/update/key.rs."
+            exit 1
+          fi
+          minisign -V -P "$pub" -m signed/manifest.json -x signed/manifest.json.minisig
       - name: Create the semver release
         if: github.ref_type == 'tag'
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --latest
-          gh release upload "$GITHUB_REF_NAME" signed/manifest.json signed/manifest.json.minisig
+          # A draft until all assets and the manifest are there: a failed
+          # upload leaves no public release without a manifest.
+          gh release create "$GITHUB_REF_NAME" dist/* signed/manifest.json signed/manifest.json.minisig \
+            --draft --generate-notes
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
       - name: Replace the edge pre-release
         if: github.ref_type == 'branch'
         run: |
           gh release delete edge --cleanup-tag --yes || true
-          gh release create edge dist/* \
+          gh release create edge dist/* signed/manifest.json signed/manifest.json.minisig \
+            --draft \
             --target "$GITHUB_SHA" \
             --prerelease --latest=false \
             --title "edge (main ${GITHUB_SHA::7})" \
             --notes "Bleeding-edge build of main at $GITHUB_SHA. Not a stable release: use the latest vX.Y.Z release for normal installs."
-          gh release upload edge signed/manifest.json signed/manifest.json.minisig
+          gh release edit edge --draft=false
