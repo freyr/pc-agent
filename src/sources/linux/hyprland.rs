@@ -86,6 +86,16 @@ fn monitors_limited(
     busy: &'static AtomicBool,
     limit: Duration,
 ) -> Option<Vec<Monitor>> {
+    limited(busy, limit, move || search(&run_user, uid)).flatten()
+}
+
+/// Runs `job` on a helper thread and waits for it at most `limit`. `None`
+/// when the limit passed or an earlier helper still runs (`busy`).
+fn limited<T: Send + 'static>(
+    busy: &'static AtomicBool,
+    limit: Duration,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     if busy.swap(true, Ordering::SeqCst) {
         return None;
     }
@@ -93,15 +103,30 @@ fn monitors_limited(
     let spawned = thread::Builder::new()
         .name("hyprland-socket".into())
         .spawn(move || {
-            let list = search(&run_user, uid);
+            let result = job();
             busy.store(false, Ordering::SeqCst);
-            let _ = tx.send(list);
+            let _ = tx.send(result);
         });
     if spawned.is_err() {
         busy.store(false, Ordering::SeqCst);
         return None;
     }
-    rx.recv_timeout(limit).ok().flatten()
+    rx.recv_timeout(limit).ok()
+}
+
+/// For `diagnose`: `probe` of one socket with the same 1 s limit as the
+/// agent. `None` when the socket gave no answer within the limit (or an
+/// earlier probe still runs), else the result of `probe`.
+pub fn probe_limited(socket: PathBuf) -> Option<Option<Vec<Monitor>>> {
+    probe_with(socket, &BUSY, LIMIT)
+}
+
+fn probe_with(
+    socket: PathBuf,
+    busy: &'static AtomicBool,
+    limit: Duration,
+) -> Option<Option<Vec<Monitor>>> {
+    limited(busy, limit, move || probe(&socket))
 }
 
 fn search(run_user: &Path, uid: u32) -> Option<Vec<Monitor>> {
@@ -203,6 +228,46 @@ mod tests {
         // After the read timeout the helper ends and clears the flag.
         thread::sleep(Duration::from_millis(700));
         assert!(!BUSY_T.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_probe_without_a_reply_stops_at_the_limit() {
+        static BUSY_T: AtomicBool = AtomicBool::new(false);
+        let base = temp_dir("hypr-probe-silent");
+        silent_socket(&base, Duration::from_secs(2));
+        let socket = base.join("1000/hypr/sig/.socket.sock");
+
+        let start = Instant::now();
+        assert_eq!(
+            probe_with(socket, &BUSY_T, Duration::from_millis(200)),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            start.elapsed()
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_probe_of_a_live_socket_gives_its_monitors() {
+        static BUSY_T: AtomicBool = AtomicBool::new(false);
+        let base = temp_dir("hypr-probe-live");
+        let dir = base.join("1000/hypr/sig");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = UnixListener::bind(dir.join(".socket.sock")).unwrap();
+        thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(REPLY.as_bytes());
+            }
+        });
+        let result = probe_with(dir.join(".socket.sock"), &BUSY_T, LIMIT);
+        let list = result.flatten().expect("the socket answers");
+        assert_eq!(rules::lock_read(&list), rules::LockRead::Locked);
         std::fs::remove_dir_all(&base).unwrap();
     }
 

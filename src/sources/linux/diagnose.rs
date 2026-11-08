@@ -187,7 +187,7 @@ pub async fn run() {
             }
             let mut answer = None;
             for (mtime, dir) in dirs {
-                let monitors = hyprland::probe(&dir.join(".socket.sock"));
+                let result = hyprland::probe_limited(dir.join(".socket.sock"));
                 let secs = mtime
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs() as i64);
@@ -195,12 +195,13 @@ pub async fn run() {
                     "  {}  mtime {}  socket {}",
                     dir.display(),
                     format_timestamp(secs),
-                    if monitors.is_some() {
-                        "answers"
-                    } else {
-                        "does not answer"
+                    match &result {
+                        Some(Some(_)) => "answers",
+                        Some(None) => "does not answer",
+                        None => "no answer within 1 s",
                     }
                 );
+                let monitors = result.flatten();
                 if answer.is_none() {
                     answer = monitors;
                 }
