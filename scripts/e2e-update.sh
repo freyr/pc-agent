@@ -147,7 +147,11 @@ EOF
 mkdir -p "$work/www/latest/download"
 python3 -m http.server "$port" --bind 127.0.0.1 --directory "$work/www" > "$work/http.log" 2>&1 &
 http_pid=$!
-sleep 2
+for _ in $(seq 60); do
+  curl -s -o /dev/null "http://127.0.0.1:$port/" && break
+  sleep 0.5
+done
+curl -s -o /dev/null "http://127.0.0.1:$port/" || { echo "the test HTTP server does not listen on $port" >&2; exit 1; }
 
 # The signed `stable` release of one build.
 release() {

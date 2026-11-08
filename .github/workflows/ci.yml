@@ -561,6 +561,12 @@ jobs:
           $server = Start-Process -FilePath python -PassThru -NoNewWindow `
             -ArgumentList '-m', 'http.server', '18080', '--bind', '127.0.0.1', '--directory', $www `
             -RedirectStandardOutput "$env:E2E\http-out.log" -RedirectStandardError "$env:E2E\http-err.log"
+          $ready = $false
+          for ($i = 0; $i -lt 60 -and -not $ready; $i++) {
+            try { (New-Object System.Net.Sockets.TcpClient('127.0.0.1', 18080)).Close(); $ready = $true }
+            catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $ready) { throw "the test HTTP server does not listen on 18080" }
           function Publish-Release($version, $commit, $file) {
             Copy-Item $file "$dl\pc-agent-x86_64-windows.exe" -Force
             $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
