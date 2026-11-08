@@ -300,13 +300,13 @@ echo "update config: $config"
 # Before a check: up to date (JSON keys in sorted order).
 wait_state '"installed_version":"0.0.2","latest_version":"0.0.2"' 30
 
-# The failed 0.0.3 is still the release: the command checks, shows it, and
-# does not install it.
+# The failed 0.0.3 is still the release: the command checks, does not
+# install it, shows "up to date" and names the failed build in the summary.
 mosquitto_pub -h 127.0.0.1 -t "$update_command" -m install
-wait_state '"latest_version":"0.0.3"' 60
+wait_state '"release_summary":"Build 0.0.3 failed before' 60
 sleep 5
 cmp -s "$bin" "$work/pc-agent-0.0.2" || fail "the install command installed the failed build"
-wait_state '"in_progress":false,"installed_version":"0.0.2"' 5
+wait_state '"in_progress":false,"installed_version":"0.0.2","latest_version":"0.0.2"' 5
 echo "OK: the install command does not install a failed build"
 
 # A new release: the command installs it from the service (auto is off).

@@ -1,6 +1,8 @@
 //! The update schedule of the service and the state of the HA `update`
 //! entity. The service checks 10 min after the start of its run loop and
-//! then every 24 h, only while connected. With `[update] auto`, a check
+//! then every 24 h of wall time, only while connected. The 24 h use the
+//! wall clock, because the tokio clock (CLOCK_MONOTONIC on Linux,
+//! CLOCK_UPTIME_RAW on macOS) stops while the PC sleeps. With `[update] auto`, a check
 //! installs an available update when the last automatic install is 7 days
 //! old or more. The install command of HA checks at once and installs an
 //! available update, also with `auto` off. A build that failed after an
@@ -28,8 +30,11 @@ use crate::entities::UPDATE_INSTALL;
 
 /// The first check after the start of the run loop.
 pub const FIRST_CHECK: Duration = Duration::from_secs(10 * 60);
-/// The time between two scheduled checks.
-pub const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// The wall time between two scheduled checks.
+pub const CHECK_EVERY: TimeDelta = TimeDelta::hours(24);
+/// The tick at which the service compares the wall clock with the last
+/// scheduled check.
+pub const TICK: Duration = Duration::from_secs(60);
 /// The shortest time between two automatic installs.
 pub const AUTO_EVERY: TimeDelta = TimeDelta::days(7);
 /// The `title` of the entity state.
@@ -117,6 +122,9 @@ pub struct Updater {
     /// The latest version that the last check found (entity format), or
     /// `None` before the first check.
     latest: Option<(String, String)>,
+    /// The `release_summary` of the entity: why a newer build does not
+    /// install, or empty.
+    summary: String,
     in_progress: bool,
 }
 
@@ -124,7 +132,13 @@ struct Sched {
     paths: Paths,
     effects: Arc<dyn Effects>,
     auto: bool,
-    next_check: Instant,
+    /// The first scheduled check (tokio clock), until it starts.
+    first_due: Option<Instant>,
+    /// After the first check: the next compare of the wall clock with
+    /// `last_scheduled` (tokio clock).
+    tick_at: Instant,
+    /// The wall time of the start of the last scheduled check.
+    last_scheduled: Option<DateTime<Utc>>,
     job: Option<JoinHandle<Done>>,
 }
 
@@ -169,12 +183,15 @@ impl Updater {
                 paths,
                 effects,
                 auto,
-                next_check: start + FIRST_CHECK,
+                first_due: Some(start + FIRST_CHECK),
+                tick_at: start + FIRST_CHECK,
+                last_scheduled: None,
                 job: None,
             }),
             channel,
             running,
             latest: None,
+            summary: String::new(),
             in_progress: false,
         }
     }
@@ -186,12 +203,14 @@ impl Updater {
             channel,
             running: Build::RUNNING,
             latest: None,
+            summary: String::new(),
             in_progress: false,
         }
     }
 
     /// The JSON state of the entity. Before the first check, and when the
-    /// check finds no newer build, `latest_version` is `installed_version`:
+    /// check finds no newer build or a failed one, `latest_version` is
+    /// `installed_version`:
     /// HA keeps the earlier value of a missing key, and shows `unknown`
     /// with no value. All keys are always present for the same reason.
     pub fn state_payload(&self) -> String {
@@ -207,19 +226,23 @@ impl Updater {
             "installed_version": installed,
             "latest_version": latest,
             "release_url": url,
+            "release_summary": self.summary,
             "title": TITLE,
             "in_progress": self.in_progress,
         })
         .to_string()
     }
 
-    /// The time of the next scheduled check; `None` while a job runs or
-    /// with no schedule. The run loop waits for it only while connected.
+    /// The time at which the run loop calls `on_timer`: the first check
+    /// 10 min after the start, then a tick every minute; `None` while a job
+    /// runs or with no schedule. The run loop waits for it only while
+    /// connected, so a tick that passed while disconnected comes at the
+    /// next ConnAck.
     pub fn next_check(&self) -> Option<Instant> {
         self.sched
             .as_ref()
             .filter(|s| s.job.is_none())
-            .map(|s| s.next_check)
+            .map(|s| s.first_due.unwrap_or(s.tick_at))
     }
 
     /// A job runs.
@@ -227,13 +250,33 @@ impl Updater {
         self.sched.as_ref().is_some_and(|s| s.job.is_some())
     }
 
-    /// The time of `next_check` passed (`now`): starts a scheduled check;
-    /// the next one is 24 h later.
-    pub fn on_timer(&mut self, now: Instant) {
-        if let Some(s) = &mut self.sched {
-            s.next_check = now + CHECK_EVERY;
+    /// The time of `next_check` passed (tokio time `now`, wall time
+    /// `wall`). Starts the first scheduled check, or a later one when the
+    /// last one started 24 h of wall time ago or more. A clock that went
+    /// back moves the reference to `wall`: no check storm, and the next
+    /// check comes at most 24 h later.
+    pub fn on_timer(&mut self, now: Instant, wall: DateTime<Utc>) {
+        let Some(s) = &mut self.sched else { return };
+        if s.job.is_some() {
+            return;
         }
-        self.start_check(Trigger::Schedule);
+        s.tick_at = now + TICK;
+        let due = match (s.first_due, s.last_scheduled) {
+            (None, Some(last)) if wall < last => {
+                warn!(
+                    "the clock went back from {last} to {wall}: the next update check is 24 h later"
+                );
+                s.last_scheduled = Some(wall);
+                false
+            }
+            (None, Some(last)) => wall.signed_duration_since(last) >= CHECK_EVERY,
+            _ => true,
+        };
+        if due {
+            s.first_due = None;
+            s.last_scheduled = Some(wall);
+            self.start_check(Trigger::Schedule);
+        }
     }
 
     /// A message on the command topic. Only a live `install` starts a check
@@ -312,12 +355,18 @@ impl Updater {
                         return Step::Publish;
                     }
                 };
-                let newer = matches!(outcome, Outcome::Available(_) | Outcome::FailedBefore(_));
-                self.latest = Some(if newer {
-                    (
-                        shown(self.channel, &manifest.version, &manifest.commit),
-                        release_url(self.channel, &manifest.version),
-                    )
+                // A failed build shows as "up to date" (its Install button
+                // would do nothing), with the reason in the summary.
+                let shown_new = shown(self.channel, &manifest.version, &manifest.commit);
+                self.summary = match outcome {
+                    Outcome::FailedBefore(_) => format!(
+                        "Build {shown_new} failed before and is not installed automatically; \
+                         `pc-agent update` can install it."
+                    ),
+                    _ => String::new(),
+                };
+                self.latest = Some(if matches!(outcome, Outcome::Available(_)) {
+                    (shown_new, release_url(self.channel, &manifest.version))
                 } else {
                     (
                         shown(self.channel, self.running.version, self.running.commit),
@@ -567,33 +616,90 @@ mod tests {
         steps
     }
 
+    /// Waits for the next wake of the schedule and calls `on_timer` with
+    /// the wall time `wall`; gives `true` when a check started.
+    async fn wake(u: &mut Updater, wall: DateTime<Utc>) -> bool {
+        let at = u.next_check().unwrap();
+        tokio::time::sleep_until(at).await;
+        u.on_timer(Instant::now(), wall);
+        u.busy()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_service_checks_10_min_after_its_start_then_every_24_h() {
         let paths = paths("timer");
         let fake = Fake::new(Kind::UpToDate);
         let start = Instant::now();
+        let w0 = utc("2026-11-10T00:00:00Z");
+        // A PC that never sleeps: the wall time moves with the tokio time.
+        let wall = || w0 + TimeDelta::from_std(Instant::now() - start).unwrap();
         let mut u = updater(&paths, &fake, true, Channel::Stable);
         assert_eq!(u.next_check(), Some(start + Duration::from_secs(600)));
         let mut checks = Vec::new();
         let until = start + Duration::from_secs(3 * 24 * 3600);
-        while let Some(at) = u.next_check().filter(|at| *at < until) {
-            tokio::time::sleep_until(at).await;
-            u.on_timer(Instant::now());
-            assert!(u.busy());
-            assert_eq!(u.next_check(), None, "no timer while a job runs");
-            checks.push(Instant::now() - start);
-            assert_eq!(
-                finish(&mut u, utc("2026-11-10T12:00:00Z")).await,
-                [Step::Publish]
-            );
+        while u.next_check().is_some_and(|at| at < until) {
+            tokio::time::sleep_until(u.next_check().unwrap()).await;
+            u.on_timer(Instant::now(), wall());
+            if u.busy() {
+                assert_eq!(u.next_check(), None, "no timer while a job runs");
+                checks.push(Instant::now() - start);
+                assert_eq!(finish(&mut u, wall()).await, [Step::Publish]);
+            }
+            // The wake after a check is a short tick, not 24 h later.
+            assert!(u.next_check().unwrap() - Instant::now() <= TICK);
         }
         let minutes: Vec<u64> = checks.iter().map(|d| d.as_secs() / 60).collect();
         assert_eq!(minutes, [10, 24 * 60 + 10, 48 * 60 + 10]);
         assert_eq!(fake.checks(), 3);
         assert_eq!(fake.installs(), 0);
         let recorded = pending::read_state(&paths).unwrap();
-        assert_eq!(recorded.last_check.as_deref(), Some("2026-11-10T12:00:00Z"));
+        assert_eq!(recorded.last_check.as_deref(), Some("2026-11-12T00:10:00Z"));
         assert_eq!(recorded.last_auto_install, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_of_25_h_gives_a_check_at_the_next_tick() {
+        let paths = paths("suspend");
+        let fake = Fake::new(Kind::UpToDate);
+        let w0 = utc("2026-11-20T12:00:00Z");
+        let mut u = updater(&paths, &fake, true, Channel::Stable);
+        assert!(wake(&mut u, w0).await, "the first check at 10 min");
+        finish(&mut u, w0).await;
+        for minute in 1..=3 {
+            assert!(!wake(&mut u, w0 + TimeDelta::minutes(minute)).await);
+        }
+        // The PC sleeps for 25 h: the tokio clock (CLOCK_MONOTONIC,
+        // CLOCK_UPTIME_RAW) stops, the wall clock moves on.
+        let before = Instant::now();
+        assert!(wake(&mut u, w0 + TimeDelta::hours(25)).await);
+        assert!(Instant::now() - before <= TICK);
+        finish(&mut u, w0 + TimeDelta::hours(25)).await;
+        // The next tick gives no second check.
+        assert!(!wake(&mut u, w0 + TimeDelta::hours(25) + TimeDelta::minutes(1)).await);
+        assert_eq!(fake.checks(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_set_back_gives_no_check_storm() {
+        let paths = paths("clock-back");
+        let fake = Fake::new(Kind::UpToDate);
+        let w0 = utc("2026-11-20T12:00:00Z");
+        let mut u = updater(&paths, &fake, true, Channel::Stable);
+        assert!(wake(&mut u, w0).await);
+        finish(&mut u, w0).await;
+        // The clock goes back 3 h, then runs on for 23 h 59 min: no check.
+        let back = w0 - TimeDelta::hours(3);
+        for minute in (0..24 * 60).step_by(7) {
+            assert!(
+                !wake(&mut u, back + TimeDelta::minutes(minute)).await,
+                "{minute}"
+            );
+        }
+        // 24 h after the jump back: one check (the delay is at most 24 h).
+        assert!(wake(&mut u, back + TimeDelta::hours(24)).await);
+        finish(&mut u, back + TimeDelta::hours(24)).await;
+        assert!(!wake(&mut u, back + TimeDelta::hours(24) + TimeDelta::minutes(1)).await);
+        assert_eq!(fake.checks(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -617,7 +723,7 @@ mod tests {
             .unwrap();
             let fake = Fake::new(Kind::Available);
             let mut u = updater(&paths, &fake, true, Channel::Stable);
-            u.on_timer(Instant::now());
+            u.on_timer(Instant::now(), utc("2026-11-20T12:00:00Z"));
             let steps = finish(&mut u, now).await;
             let recorded = pending::read_state(&paths).unwrap();
             assert_eq!(recorded.last_check.as_deref(), Some("2026-11-20T12:00:00Z"));
@@ -645,7 +751,7 @@ mod tests {
         let paths = paths("auto-off");
         let fake = Fake::new(Kind::Available);
         let mut u = updater(&paths, &fake, false, Channel::Stable);
-        u.on_timer(Instant::now());
+        u.on_timer(Instant::now(), utc("2026-11-20T12:00:00Z"));
         assert_eq!(
             finish(&mut u, utc("2026-11-20T12:00:00Z")).await,
             [Step::Publish]
@@ -655,6 +761,7 @@ mod tests {
         let s = state(&u);
         assert_eq!(s["installed_version"], "0.3.0");
         assert_eq!(s["latest_version"], "0.3.1");
+        assert_eq!(s["release_summary"], "");
         assert_eq!(
             s["release_url"],
             "https://github.com/freyr/pc-agent/releases/tag/v0.3.1"
@@ -720,17 +827,25 @@ mod tests {
         let fake = Fake::new(Kind::FailedBefore);
         let mut u = updater(&paths, &fake, true, Channel::Stable);
         let now = utc("2026-11-20T12:00:00Z");
-        u.on_timer(Instant::now());
+        u.on_timer(Instant::now(), utc("2026-11-20T12:00:00Z"));
         assert_eq!(finish(&mut u, now).await, [Step::Publish]);
         assert!(u.on_command(b"install", false));
         assert_eq!(finish(&mut u, now).await, [Step::Publish]);
         assert_eq!(fake.installs(), 0);
+        // HA shows "up to date" (no Install button that does nothing) and
+        // says why.
+        let s = state(&u);
+        assert_eq!(s["latest_version"], "0.3.0");
+        assert_eq!(
+            s["release_summary"],
+            "Build 0.3.1 failed before and is not installed automatically; \
+             `pc-agent update` can install it."
+        );
         // The check got the failed list of update-state.json.
         assert_eq!(
             *fake.failed_seen.lock().unwrap(),
             vec![vec![NEW.to_string()]; 2]
         );
-        assert_eq!(state(&u)["latest_version"], "0.3.1");
         assert_eq!(pending::read_state(&paths).unwrap().failed.len(), 1);
     }
 
@@ -741,7 +856,7 @@ mod tests {
         fs::write(paths.state(), "not json").unwrap();
         let fake = Fake::new(Kind::Available);
         let mut u = updater(&paths, &fake, true, Channel::Stable);
-        u.on_timer(Instant::now());
+        u.on_timer(Instant::now(), utc("2026-11-20T12:00:00Z"));
         assert_eq!(
             finish(&mut u, utc("2026-11-20T12:00:00Z")).await,
             [Step::Publish]
@@ -756,7 +871,7 @@ mod tests {
         let paths = paths("install-fails");
         let fake = Fake::with(Kind::Available, false);
         let mut u = updater(&paths, &fake, true, Channel::Stable);
-        u.on_timer(Instant::now());
+        u.on_timer(Instant::now(), utc("2026-11-20T12:00:00Z"));
         let steps = finish(&mut u, utc("2026-11-20T12:00:00Z")).await;
         assert_eq!(steps, [Step::Publish, Step::Publish]);
         assert_eq!(fake.installs(), 1);
@@ -779,10 +894,12 @@ mod tests {
                 "in_progress",
                 "installed_version",
                 "latest_version",
+                "release_summary",
                 "release_url",
                 "title"
             ]
         );
+        assert_eq!(s["release_summary"], "");
         assert_eq!(s["installed_version"], "0.3.0");
         assert_eq!(s["latest_version"], "0.3.0");
         assert_eq!(s["title"], "pc-agent");
@@ -807,13 +924,13 @@ mod tests {
         let paths = paths("edge");
         let fake = Fake::new(Kind::Available);
         let mut u = updater(&paths, &fake, false, Channel::Edge);
-        u.on_timer(Instant::now());
+        u.on_timer(Instant::now(), utc("2026-11-20T12:00:00Z"));
         finish(&mut u, utc("2026-11-20T12:00:00Z")).await;
         assert_eq!(state(&u)["latest_version"], "0.3.1 (2222222)");
         // An up-to-date check shows the installed build as the latest.
         let fake = Fake::new(Kind::UpToDate);
         let mut u = updater(&paths, &fake, false, Channel::Edge);
-        u.on_timer(Instant::now());
+        u.on_timer(Instant::now(), utc("2026-11-20T12:00:00Z"));
         finish(&mut u, utc("2026-11-20T12:00:00Z")).await;
         assert_eq!(state(&u)["latest_version"], "0.3.0 (1111111)");
     }

@@ -436,7 +436,7 @@ where
                 if retry_at.is_some() => retry_at = None,
             // A check that is due while disconnected runs after the next ConnAck.
             _ = tokio::time::sleep_until(check_at.unwrap_or_else(tokio::time::Instant::now)),
-                if connected && check_at.is_some() => updater.on_timer(tokio::time::Instant::now()),
+                if connected && check_at.is_some() => updater.on_timer(tokio::time::Instant::now(), chrono::Utc::now()),
             done = updater.job_done(), if updater.busy() => {
                 let step = updater.on_job_done(done, chrono::Utc::now());
                 if connected {
