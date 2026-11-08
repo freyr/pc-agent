@@ -149,14 +149,15 @@ pub fn state_topic(device: &str, entity: &Entity) -> String {
     )
 }
 
-/// The device block of every discovery configuration.
+/// The device block of every discovery configuration. `sw_version` is the
+/// `installed_version` of the update entity (with the commit on `edge`).
 fn device_block(cfg: &Config, model: &str) -> Value {
     json!({
         "identifiers": cfg.device.identifier,
         "name": cfg.device.name,
         "manufacturer": "pc-agent",
         "model": model,
-        "sw_version": crate::update::VERSION,
+        "sw_version": crate::update::shown_running(cfg.update.channel),
     })
 }
 
@@ -480,6 +481,35 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
             assert_eq!(d["model"], "3.1.0");
             assert_eq!(d["sw_version"], crate::update::VERSION);
         }
+    }
+
+    #[test]
+    fn sw_version_is_the_installed_version_of_the_update_entity() {
+        let stable = Config::parse(JAHURTX).unwrap();
+        let mut edge = Config::parse(JAHURTX).unwrap();
+        edge.update.channel = crate::update::Channel::Edge;
+        for cfg in [stable, edge] {
+            let state: Value = serde_json::from_str(
+                &crate::update::Updater::disabled(cfg.update.channel).state_payload(),
+            )
+            .unwrap();
+            let device = &discovery_payload(&cfg, &LASTBOOT, MODEL)["device"];
+            assert_eq!(device["sw_version"], state["installed_version"]);
+            assert_eq!(
+                update_discovery_payload(&cfg, MODEL)["device"]["sw_version"],
+                state["installed_version"]
+            );
+        }
+        let mut edge = Config::parse(JAHURTX).unwrap();
+        edge.update.channel = crate::update::Channel::Edge;
+        let shown = discovery_payload(&edge, &LASTBOOT, MODEL)["device"]["sw_version"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            shown.starts_with(&format!("{} (", crate::update::VERSION)) && shown.ends_with(')'),
+            "{shown}"
+        );
     }
 
     #[test]

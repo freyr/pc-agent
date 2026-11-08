@@ -12,6 +12,14 @@ pub use install::update_command;
 pub use pending::{Paths, Start, Watch};
 pub use schedule::{Step, Updater};
 
+/// The version of this binary as HA shows it: the version on `stable`, the
+/// version and the short commit on `edge`. The device block (`sw_version`)
+/// and `installed_version` of the update entity use it.
+pub fn shown_running(channel: Channel) -> String {
+    let running = check::Build::RUNNING;
+    schedule::shown(channel, running.version, running.commit)
+}
+
 /// The test feature `update-test-exit`: the service path exits with a
 /// failure right after the pending-file check (a broken new build).
 pub const TEST_EXIT: bool = cfg!(feature = "update-test-exit");
