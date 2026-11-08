@@ -7,7 +7,6 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -151,7 +150,7 @@ fn url(base: &str, channel: Channel, file: &str) -> String {
 /// Downloads the manifest and its signature of `channel` from `base` and
 /// returns the manifest only when the signature verifies with `public_key`.
 pub fn fetch(base: &str, channel: Channel, public_key: &str) -> Result<Manifest> {
-    let agent = agent(base)?;
+    let agent = agent();
     let manifest = download(&agent, &url(base, channel, "manifest.json")).map_err(|e| {
         match e.downcast_ref::<ureq::Error>() {
             Some(ureq::Error::StatusCode(404)) => match channel {
@@ -171,53 +170,18 @@ pub fn fetch(base: &str, channel: Channel, public_key: &str) -> Result<Manifest>
     verify(&manifest, &signature, public_key)
 }
 
-/// An HTTPS client: rustls with the graviola crypto provider (pure Rust, so
-/// each target builds without a C compiler) and the webpki roots, a timeout,
-/// and the redirects of GitHub to its asset host.
-fn agent(base: &str) -> Result<ureq::Agent> {
-    // graviola stops the process (an assert, and the release build aborts
-    // on a panic) on a CPU without the features that it needs. It runs only
-    // for HTTPS: the tests use plain HTTP, also in an emulated x86_64
-    // container that has no AVX2.
-    if base.starts_with("https:") && !graviola_cpu() {
-        bail!(
-            "this CPU does not have the instructions of the TLS library (graviola needs \
-             AVX2 and ADX on x86_64)"
-        );
-    }
+/// An HTTPS client: rustls with the ring crypto provider and the webpki
+/// roots (no OS certificate store), a timeout, and the redirects of GitHub to
+/// its asset host.
+fn agent() -> ureq::Agent {
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
-        .unversioned_rustls_crypto_provider(Arc::new(rustls_graviola::default_provider()))
         .build();
-    Ok(ureq::Agent::config_builder()
+    ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
         .tls_config(tls)
         .build()
-        .into())
-}
-
-/// The CPU features that graviola 0.4 asserts (`verify_cpu_features`).
-fn graviola_cpu() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("aes")
-            && std::arch::is_x86_feature_detected!("pclmulqdq")
-            && std::arch::is_x86_feature_detected!("bmi1")
-            && std::arch::is_x86_feature_detected!("adx")
-            && std::arch::is_x86_feature_detected!("avx")
-            && std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        std::arch::is_aarch64_feature_detected!("neon")
-            && std::arch::is_aarch64_feature_detected!("aes")
-            && std::arch::is_aarch64_feature_detected!("pmull")
-            && std::arch::is_aarch64_feature_detected!("sha2")
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        false
-    }
+        .into()
 }
 
 /// The body of a GET of `url`, at most `BODY_LIMIT` bytes.

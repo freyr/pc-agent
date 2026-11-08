@@ -313,16 +313,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "graviola"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1a15622a211648cbf64f485e0369791466d133eb6578fd99e4a61230c88a6aa"
-dependencies = [
- "cfg-if",
- "getrandom 0.4.3",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -593,7 +583,6 @@ dependencies = [
  "minisign-verify",
  "nvml-wrapper",
  "rumqttc",
- "rustls-graviola",
  "semver",
  "serde",
  "serde_json",
@@ -718,20 +707,11 @@ checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-graviola"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf5d0a370be690f7f1aa4e1b912fde3f5f9a5c53285062fd2d6ac1a52ab3e883"
-dependencies = [
- "graviola",
- "rustls",
 ]
 
 [[package]]
