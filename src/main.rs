@@ -25,13 +25,17 @@ use crate::core::Core;
 const USAGE: &str = "\
 Usage: pc-agent [--config <path>]
        pc-agent diagnose
-       pc-agent update --check [--channel stable|edge]
+       pc-agent update [--check] [--channel stable|edge]
 
 Publishes the state of this PC to Home Assistant over MQTT.
 
 Commands:
   diagnose         Print what each source reads and what the agent makes of
                    it, once, then exit (Linux; run it with sudo). Needs no config.
+  update           Check the release channel, install a newer signed build
+                   in place of this binary (also a build that failed
+                   before), and restart the service pc-agent. Run it with
+                   sudo, from the installed binary.
   update --check   Check the release channel for a newer signed build and
                    print the result. Installs nothing; needs no root. The
                    channel is --channel, else [update] channel of the config
@@ -49,7 +53,7 @@ Usage: pc-agent [--config <path>]
        pc-agent install [--config <path>]
        pc-agent uninstall
        pc-agent diagnose [--config <path>]
-       pc-agent update --check [--channel stable|edge] [--config <path>]
+       pc-agent update [--check] [--channel stable|edge] [--config <path>]
 
 Publishes the state of this PC to Home Assistant over MQTT. The Windows
 service pc-agent runs it; in a console it runs until Ctrl+C.
@@ -63,6 +67,10 @@ Commands:
   diagnose         Print what each Windows source reads, once, then exit. It
                    publishes nothing: the MQTT check only connects and
                    disconnects. Run it as SYSTEM for the helper start test.
+  update           Check the release channel, install a newer signed build
+                   in place of this exe (also a build that failed before),
+                   and restart the service pc-agent. Run it as administrator,
+                   from the installed exe.
   update --check   Check the release channel for a newer signed build and
                    print the result. Installs nothing; needs no admin. The
                    channel is --channel, else [update] channel of the config
@@ -108,6 +116,12 @@ enum Command {
     /// `update --check [--channel stable|edge]` (Windows: also
     /// `[--config <path>]`).
     UpdateCheck {
+        channel: Option<update::Channel>,
+        config: Option<PathBuf>,
+    },
+    /// `update [--channel stable|edge]` (Windows: also `[--config <path>]`):
+    /// check and install, then restart the service.
+    Update {
         channel: Option<update::Channel>,
         config: Option<PathBuf>,
     },
@@ -173,8 +187,8 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
 }
 
 /// The arguments after `update`: `--verify <manifest> <signature> <public
-/// key file>`, or `--check [--channel stable|edge]` (Windows: also
-/// `[--config <path>]`) in any order.
+/// key file>`, or `[--check] [--channel stable|edge]` (Windows: also
+/// `[--config <path>]`) in any order. Without `--check`, `update` installs.
 fn update_args(mut args: impl Iterator<Item = String>) -> Result<Command> {
     let first = args.next();
     if first.as_deref() == Some("--verify") {
@@ -215,10 +229,19 @@ fn update_args(mut args: impl Iterator<Item = String>) -> Result<Command> {
         }
         next = args.next();
     }
-    if !check {
-        bail!("update needs --check or --verify");
-    }
-    Ok(Command::UpdateCheck { channel, config })
+    Ok(if check {
+        Command::UpdateCheck { channel, config }
+    } else {
+        Command::Update { channel, config }
+    })
+}
+
+/// The pending-file check of the self-update is the first step of the
+/// service path: on Linux and macOS the run with no subcommand, on Windows
+/// the service entry (`sources::run_as_service`). A CLI run never reads or
+/// changes the start count.
+fn pending_check_applies(command: &Command) -> bool {
+    cfg!(not(windows)) && matches!(command, Command::Run { .. })
 }
 
 /// The optional `--config <path>` after `command`, and nothing after it.
@@ -237,34 +260,44 @@ fn config_arg(args: &mut impl Iterator<Item = String>, command: &str) -> Result<
 }
 
 fn main() -> ExitCode {
-    let config_path = match parse_args(std::env::args().skip(1)) {
-        Ok(Command::Help) => {
-            println!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        Ok(Command::Diagnose { config }) => return diagnose(config),
-        Ok(Command::UpdateVerify {
-            manifest,
-            signature,
-            public_key,
-        }) => return update::verify_files(&manifest, &signature, &public_key),
-        Ok(Command::UpdateCheck { channel, config }) => {
-            let config = config.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
-            return update::check_command(channel, &config);
-        }
-        #[cfg(windows)]
-        Ok(Command::SessionHelperProbe) => return sources::probe(),
-        #[cfg(windows)]
-        Ok(Command::SessionHelper { pipe }) => return sources::session_helper(pipe.as_deref()),
-        #[cfg(windows)]
-        Ok(Command::Install { config }) => return sources::install(config.as_deref()),
-        #[cfg(windows)]
-        Ok(Command::Uninstall) => return sources::uninstall(),
-        Ok(Command::Run { config }) => config,
+    let command = match parse_args(std::env::args().skip(1)) {
+        Ok(command) => command,
         Err(e) => {
             eprintln!("error: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
+    };
+    // The first step of the service path, before the configuration, the
+    // log and the OS init.
+    let start = pending_check_applies(&command).then(update::service_start);
+    let config_path = match command {
+        Command::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Command::Diagnose { config } => return diagnose(config),
+        Command::UpdateVerify {
+            manifest,
+            signature,
+            public_key,
+        } => return update::verify_files(&manifest, &signature, &public_key),
+        Command::UpdateCheck { channel, config } => {
+            let config = config.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
+            return update::check_command(channel, &config);
+        }
+        Command::Update { channel, config } => {
+            let config = config.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
+            return update::update_command(channel, &config);
+        }
+        #[cfg(windows)]
+        Command::SessionHelperProbe => return sources::probe(),
+        #[cfg(windows)]
+        Command::SessionHelper { pipe } => return sources::session_helper(pipe.as_deref()),
+        #[cfg(windows)]
+        Command::Install { config } => return sources::install(config.as_deref()),
+        #[cfg(windows)]
+        Command::Uninstall => return sources::uninstall(),
+        Command::Run { config } => config,
     };
 
     // Under the service control manager, the service runs the agent.
@@ -277,8 +310,26 @@ fn main() -> ExitCode {
         .with_env_filter(env_filter())
         .init();
 
-    match run(config_path, stop_signal) {
-        Ok(()) => ExitCode::SUCCESS,
+    let watch = match start {
+        Some((start, watch)) => {
+            update::log_start(&start);
+            // The restart path: systemd (`Restart=always`) and launchd
+            // (`KeepAlive`) start the binary at the binary path again.
+            if start.must_exit() {
+                return ExitCode::SUCCESS;
+            }
+            if update::TEST_EXIT {
+                tracing::warn!("update-test-exit: exit after the pending-file check");
+                return ExitCode::FAILURE;
+            }
+            watch
+        }
+        None => update::Watch::none(),
+    };
+
+    // Exit 0 also for a restart: the service manager starts the binary again.
+    match run(config_path, stop_signal, watch) {
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e:#}");
             ExitCode::FAILURE
@@ -338,9 +389,9 @@ fn stop_signal() -> Result<impl Future<Output = ()>> {
     })
 }
 
-/// Runs the agent until the future that `stop` gives completes. `stop` is
-/// called inside the runtime.
-fn run<S, F>(config_path: PathBuf, stop: S) -> Result<()>
+/// Runs the agent until the future that `stop` gives completes, or until
+/// `watch` ends the run for a restart. `stop` is called inside the runtime.
+fn run<S, F>(config_path: PathBuf, stop: S, mut watch: update::Watch) -> Result<mqtt::Exit>
 where
     S: FnOnce() -> Result<F>,
     F: Future<Output = ()>,
@@ -351,7 +402,7 @@ where
         device = %cfg.device.name,
         entity_prefix = %cfg.device.entity_prefix,
         gpu = cfg.gpu.enabled,
-        version = env!("CARGO_PKG_VERSION"),
+        version = update::VERSION,
         "starting pc-agent"
     );
 
@@ -365,7 +416,17 @@ where
         let stop = stop()?;
         let poll = move || sources::poll(gpu);
         let events = sources::events();
-        mqtt::run(&cfg, &model, core, poll, events, sources::ACK_WAIT, stop).await
+        mqtt::run(
+            &cfg,
+            &model,
+            core,
+            poll,
+            events,
+            sources::ACK_WAIT,
+            stop,
+            &mut watch,
+        )
+        .await
     })
 }
 
@@ -514,7 +575,6 @@ mod tests {
                 public_key: PathBuf::from("k.pub"),
             }
         );
-        assert!(parse_args(args(&["update"])).is_err());
         assert!(parse_args(args(&["update", "--verify", "m.json", "m.json.minisig"])).is_err());
         assert!(parse_args(args(&["update", "--verify", "m", "s", "k", "x"])).is_err());
         assert!(parse_args(args(&["update", "--bogus", "m", "s", "k"])).is_err());
@@ -547,14 +607,52 @@ mod tests {
         assert!(parse_args(args(&["update", "--check", "--channel", "beta"])).is_err());
         assert!(parse_args(args(&["update", "--check", "--check"])).is_err());
         assert!(parse_args(args(&["update", "--check", "--bogus"])).is_err());
-        // Installing is U3: no `update` without --check yet.
-        assert!(parse_args(args(&["update", "--channel", "edge"])).is_err());
+    }
+
+    #[test]
+    fn update_command_installs() {
+        assert_eq!(
+            parse_args(args(&["update"])).unwrap(),
+            Command::Update {
+                channel: None,
+                config: None
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["update", "--channel", "edge"])).unwrap(),
+            Command::Update {
+                channel: Some(update::Channel::Edge),
+                config: None
+            }
+        );
+        assert!(parse_args(args(&["update", "--channel"])).is_err());
+        assert!(parse_args(args(&["update", "--channel", "edge", "--channel", "edge"])).is_err());
+        assert!(parse_args(args(&["update", "now"])).is_err());
+    }
+
+    #[test]
+    fn only_the_service_run_checks_the_pending_file() {
+        let run = parse_args(args(&[])).unwrap();
+        // Linux and macOS: the run with no subcommand. Windows: the service
+        // entry, not main.
+        assert_eq!(pending_check_applies(&run), cfg!(not(windows)));
+        for cli in [
+            vec!["diagnose"],
+            vec!["update"],
+            vec!["update", "--check"],
+            vec!["update", "--verify", "m", "s", "k"],
+            vec!["--help"],
+        ] {
+            let command = parse_args(args(&cli)).unwrap();
+            assert!(!pending_check_applies(&command), "{cli:?}");
+        }
     }
 
     #[cfg(not(windows))]
     #[test]
     fn update_check_takes_no_config_outside_windows() {
         assert!(parse_args(args(&["update", "--check", "--config", "/tmp/c.toml"])).is_err());
+        assert!(parse_args(args(&["update", "--config", "/tmp/c.toml"])).is_err());
     }
 
     #[cfg(windows)]
@@ -568,6 +666,24 @@ mod tests {
             }
         );
         assert!(parse_args(args(&["update", "--check", "--config"])).is_err());
+        assert_eq!(
+            parse_args(args(&[
+                "update",
+                "--config",
+                r"D:\ci.toml",
+                "--channel",
+                "stable"
+            ]))
+            .unwrap(),
+            Command::Update {
+                channel: Some(update::Channel::Stable),
+                config: Some(PathBuf::from(r"D:\ci.toml"))
+            }
+        );
+        let session = parse_args(args(&["session-helper"])).unwrap();
+        assert!(!pending_check_applies(&session));
+        let install = parse_args(args(&["install"])).unwrap();
+        assert!(!pending_check_applies(&install));
     }
 
     #[test]

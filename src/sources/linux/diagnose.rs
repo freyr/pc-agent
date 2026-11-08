@@ -151,7 +151,7 @@ pub fn format_rest_counts(counts: &[(String, String, usize)]) -> String {
 /// Runs the checks once and prints the result to stdout.
 pub async fn run() {
     println!("== Version");
-    println!("  pc-agent {}", env!("CARGO_PKG_VERSION"));
+    println!("  pc-agent {}", crate::update::VERSION);
     let omarchy = std::fs::read_to_string(os::VERSION_PATH)
         .map(|t| t.trim().to_string())
         .unwrap_or_else(|_| "absent".to_string());

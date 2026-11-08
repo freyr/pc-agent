@@ -27,7 +27,7 @@ use crate::core::{Snapshot, SystemEvent};
 use crate::entities::{self, Entity};
 
 pub use helper::{probe, run as session_helper};
-pub use install::{install, uninstall};
+pub use install::{install, restart_service, uninstall};
 pub use service::run_as_service;
 
 /// The folder of the configuration and the log.

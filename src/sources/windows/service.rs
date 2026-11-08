@@ -7,6 +7,11 @@
 //! and waits for the reply. The handler records each console display
 //! notification and each user presence notification for the poll. The
 //! service starts the session helpers and their pipe.
+//!
+//! The pending-file check of the self-update is the first step of the
+//! service entry. A restart (the rollback of an update) reports `Stopped`
+//! with `RESTART_EXIT_CODE`; the failure action on non-crash failures (set
+//! by `install` and at each start) starts the service again after 5 s.
 
 use std::ffi::OsString;
 use std::os::windows::io::AsRawHandle;
@@ -31,9 +36,11 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::{define_windows_service, service_dispatcher};
 
+use super::install::restart_on_non_crash_failures;
 use super::{DATA_DIR, DISPLAY, EVENTS, SERVICE_NAME, record_presence, start_helpers};
 use crate::core::SystemEvent;
 use crate::logfile::LogFile;
+use crate::mqtt::Exit;
 use crate::sources::ACK_WAIT;
 use crate::sources::wts_rules::{self, ControlAction};
 
@@ -49,6 +56,10 @@ const ACCEPTED: ServiceControlAccept = ServiceControlAccept::STOP
 /// The time that the stop may take: the ack wait of `offline`, the
 /// disconnect and some margin.
 const STOP_WAIT_HINT: Duration = Duration::from_secs(5);
+
+/// The service-specific exit code of a restart: not 0, so the failure
+/// action of the service starts it again.
+const RESTART_EXIT_CODE: u32 = 10;
 
 /// The config path for the service thread, which gets no arguments from main.
 static CONFIG: OnceLock<PathBuf> = OnceLock::new();
@@ -76,6 +87,9 @@ pub fn run_as_service(config: &Path) -> Option<ExitCode> {
 
 /// The entry of the service thread.
 fn service_main(_arguments: Vec<OsString>) {
+    // The first step of the service path: before the configuration, the
+    // log and the OS init.
+    let (start, watch) = crate::update::service_start();
     // Without the log file the service runs with no log, so a log problem
     // does not stop the agent.
     let log_path = Path::new(DATA_DIR).join("pc-agent.log");
@@ -86,8 +100,35 @@ fn service_main(_arguments: Vec<OsString>) {
             .with_writer(Mutex::new(log))
             .init();
     }
-    if let Err(e) = run_service() {
+    crate::update::log_start(&start);
+    if start.must_exit() {
+        stop_at_once(RESTART_EXIT_CODE);
+        return;
+    }
+    if crate::update::TEST_EXIT {
+        warn!("update-test-exit: exit after the pending-file check");
+        stop_at_once(1);
+        return;
+    }
+    if let Err(e) = run_service(watch) {
         error!("{e:#}");
+    }
+}
+
+/// Reports `Stopped` with `exit` before the agent runs.
+fn stop_at_once(exit: u32) {
+    let result = service_control_handler::register(SERVICE_NAME, |_| {
+        ServiceControlHandlerResult::NotImplemented
+    })
+    .and_then(|handle| {
+        handle.set_service_status(status(
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            exit,
+        ))
+    });
+    if let Err(e) = result {
+        error!("cannot report Stopped: {e}");
     }
 }
 
@@ -143,7 +184,7 @@ fn forward(events: &mpsc::Sender<SystemEvent>, event: SystemEvent) {
     }
 }
 
-fn run_service() -> Result<()> {
+fn run_service(watch: crate::update::Watch) -> Result<()> {
     let (tx, rx) = unbounded_channel();
     let (events_tx, events_rx) = mpsc::channel(8);
     if let Ok(mut slot) = EVENTS.lock() {
@@ -193,6 +234,11 @@ fn run_service() -> Result<()> {
     };
     let handle = service_control_handler::register(SERVICE_NAME, handler)?;
     handle.set_service_status(status(ServiceState::Running, ACCEPTED, 0))?;
+    // At each start, so a service installed before the self-update gets it
+    // with its first updated start.
+    if let Err(e) = restart_on_non_crash_failures() {
+        warn!("cannot set the failure actions on non-crash failures: {e:#}");
+    }
     // Register only after POWER_EVENT is accepted: the SCM drops a power
     // event before that, and Windows sends the current display state at
     // registration.
@@ -224,33 +270,41 @@ fn run_service() -> Result<()> {
         .get()
         .cloned()
         .unwrap_or_else(|| PathBuf::from(crate::config::DEFAULT_PATH));
-    let result = crate::run(config, || {
-        // Inside the runtime: the pipe server runs on it.
-        start_helpers();
-        Ok(async move {
-            let preshutdown = stop_control(rx).await;
-            // windows-service frees the handler closure after Stop and
-            // Preshutdown, so accept no control from here on, before the
-            // shutdown wait below.
-            if let Err(e) = handle.set_service_status(status(
-                ServiceState::StopPending,
-                ServiceControlAccept::empty(),
-                0,
-            )) {
-                warn!(error = %e, "cannot report StopPending");
-            }
-            if preshutdown {
-                wts_rules::shutdown(&events_tx).await;
-            }
-        })
-    });
-    let exit = if result.is_ok() { 0 } else { 1 };
+    let result = crate::run(
+        config,
+        || {
+            // Inside the runtime: the pipe server runs on it.
+            start_helpers();
+            Ok(async move {
+                let preshutdown = stop_control(rx).await;
+                // windows-service frees the handler closure after Stop and
+                // Preshutdown, so accept no control from here on, before the
+                // shutdown wait below.
+                if let Err(e) = handle.set_service_status(status(
+                    ServiceState::StopPending,
+                    ServiceControlAccept::empty(),
+                    0,
+                )) {
+                    warn!(error = %e, "cannot report StopPending");
+                }
+                if preshutdown {
+                    wts_rules::shutdown(&events_tx).await;
+                }
+            })
+        },
+        watch,
+    );
+    let exit = match result {
+        Ok(Exit::Stopped) => 0,
+        Ok(Exit::Restart) => RESTART_EXIT_CODE,
+        Err(_) => 1,
+    };
     handle.set_service_status(status(
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
         exit,
     ))?;
-    result
+    result.map(|_| ())
 }
 
 /// Completes at the first `Stop` or `Preshutdown`; true for `Preshutdown`.

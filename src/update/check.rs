@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset};
 use serde::Deserialize;
 
-use super::{Asset, BUILT_AT, COMMIT, Manifest, key, verify};
+use super::{Asset, BUILT_AT, COMMIT, Manifest, verify};
 use crate::config::Update;
 
 /// The releases of the project. `stable` reads
@@ -76,7 +76,7 @@ pub struct Build<'a> {
 impl Build<'static> {
     /// This binary.
     pub const RUNNING: Build<'static> = Build {
-        version: env!("CARGO_PKG_VERSION"),
+        version: super::VERSION,
         commit: COMMIT,
         built_at: BUILT_AT,
     };
@@ -139,7 +139,7 @@ pub fn compare(
 
 /// The URL of `file` (`manifest.json` or `manifest.json.minisig`) of the
 /// release of `channel` under `base`.
-fn url(base: &str, channel: Channel, file: &str) -> String {
+pub(super) fn url(base: &str, channel: Channel, file: &str) -> String {
     let base = base.trim_end_matches('/');
     match channel {
         Channel::Stable => format!("{base}/latest/download/{file}"),
@@ -173,7 +173,7 @@ pub fn fetch(base: &str, channel: Channel, public_key: &str) -> Result<Manifest>
 /// An HTTPS client: rustls with the ring crypto provider and the webpki
 /// roots (no OS certificate store), a timeout, and the redirects of GitHub to
 /// its asset host.
-fn agent() -> ureq::Agent {
+pub(super) fn agent() -> ureq::Agent {
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::Rustls)
         .build();
@@ -217,7 +217,7 @@ pub fn check(
 /// `[update]` section of the config file at `config`, else `stable` when
 /// that file is missing or not readable. Returns the channel and where it
 /// comes from.
-fn channel_of(flag: Option<Channel>, config: &Path) -> Result<(Channel, String)> {
+pub(super) fn channel_of(flag: Option<Channel>, config: &Path) -> Result<(Channel, String)> {
     if let Some(channel) = flag {
         return Ok((channel, "from --channel".to_string()));
     }
@@ -237,8 +237,14 @@ fn channel_of(flag: Option<Channel>, config: &Path) -> Result<(Channel, String)>
 
 /// `pc-agent update --check [--channel stable|edge]`: prints the running
 /// build, the channel, the release of the channel and the result. Installs
-/// nothing. Exit 0 when the check gives a result, 1 on an error.
+/// nothing and changes no file; it reads the failed builds of
+/// `update-state.json` when it can. Exit 0 when the check gives a result, 1
+/// on an error.
 pub fn check_command(flag: Option<Channel>, config: &Path) -> ExitCode {
+    let failed = super::pending::Paths::system()
+        .and_then(|paths| super::pending::read_state(&paths))
+        .map(|state| state.failed_commits())
+        .unwrap_or_default();
     let running = Build::RUNNING;
     let short = running.commit.get(..7).unwrap_or(running.commit);
     println!(
@@ -248,12 +254,12 @@ pub fn check_command(flag: Option<Channel>, config: &Path) -> ExitCode {
     let result = channel_of(flag, config).and_then(|(channel, from)| {
         println!("channel: {channel} ({from})");
         check(
-            BASE_URL,
+            &super::base_url(),
             channel,
-            key::PUBLIC_KEY,
+            super::public_key(),
             running,
             &platform(),
-            &[],
+            &failed,
         )
     });
     match result {
@@ -291,7 +297,7 @@ fn version(text: &str, what: &str) -> Result<semver::Version> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeMap;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -551,14 +557,14 @@ mod tests {
     }
 
     /// A reply of the test server.
-    enum Reply {
+    pub(in crate::update) enum Reply {
         Ok(Vec<u8>),
         Redirect(&'static str),
     }
 
     /// An HTTP server on 127.0.0.1 that answers each GET of a path in
     /// `routes`, and 404 for each other path. Returns the base URL.
-    fn serve(routes: Vec<(&'static str, Reply)>) -> String {
+    pub(in crate::update) fn serve(routes: Vec<(&'static str, Reply)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {

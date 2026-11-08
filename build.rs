@@ -14,6 +14,10 @@
 use std::path::Path;
 use std::process::Command;
 
+/// The public key of `src/update/testdata/test.pub` (the throwaway key that
+/// signed the fixture manifest).
+const FIXTURE_KEY: &str = "RWQ+2MlekOLCM8wYNdyQldq86IT7dyJ01dgZjWDbq+j8VH7zuIua3IiJ";
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
@@ -22,6 +26,24 @@ fn main() {
         .unwrap_or(0);
     println!("cargo:rustc-env=PC_AGENT_COMMIT={commit}");
     println!("cargo:rustc-env=PC_AGENT_BUILD_TIME={}", rfc3339(seconds));
+
+    // The version, and in a build of the test feature `update-test-key`
+    // only: the version from PC_AGENT_TEST_VERSION (the CI update test
+    // builds two versions of one commit) and the public key from
+    // PC_AGENT_TEST_PUBLIC_KEY (a key that the CI job makes; default: the
+    // key of the committed fixture). A release build never reads them.
+    let mut version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    if std::env::var_os("CARGO_FEATURE_UPDATE_TEST_KEY").is_some() {
+        println!("cargo:rerun-if-env-changed=PC_AGENT_TEST_VERSION");
+        println!("cargo:rerun-if-env-changed=PC_AGENT_TEST_PUBLIC_KEY");
+        if let Ok(test) = std::env::var("PC_AGENT_TEST_VERSION") {
+            version = test;
+        }
+        let key =
+            std::env::var("PC_AGENT_TEST_PUBLIC_KEY").unwrap_or_else(|_| FIXTURE_KEY.to_string());
+        println!("cargo:rustc-env=PC_AGENT_TEST_PUBLIC_KEY={key}");
+    }
+    println!("cargo:rustc-env=PC_AGENT_VERSION={version}");
 
     // A new commit changes HEAD or the file of the branch it points to.
     let mut watched = vec!["HEAD".to_string(), "packed-refs".to_string()];

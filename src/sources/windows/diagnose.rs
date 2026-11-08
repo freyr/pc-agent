@@ -28,7 +28,7 @@ const DISCONNECT_WAIT: Duration = Duration::from_millis(500);
 /// file of `--config`, else the default path.
 pub async fn run(config: Option<&Path>) {
     println!("== Version");
-    println!("  pc-agent {}", env!("CARGO_PKG_VERSION"));
+    println!("  pc-agent {}", crate::update::VERSION);
 
     println!("== Console session");
     // SAFETY: WTSGetActiveConsoleSessionId has no arguments and no preconditions.
