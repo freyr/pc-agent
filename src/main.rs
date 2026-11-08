@@ -25,12 +25,17 @@ use crate::core::Core;
 const USAGE: &str = "\
 Usage: pc-agent [--config <path>]
        pc-agent diagnose
+       pc-agent update --check [--channel stable|edge]
 
 Publishes the state of this PC to Home Assistant over MQTT.
 
 Commands:
   diagnose         Print what each source reads and what the agent makes of
                    it, once, then exit (Linux; run it with sudo). Needs no config.
+  update --check   Check the release channel for a newer signed build and
+                   print the result. Installs nothing; needs no root. The
+                   channel is --channel, else [update] channel of the config
+                   file, else stable.
 
 Options:
   --config <path>  Config file (default: /etc/pc-agent/config.toml)
@@ -44,6 +49,7 @@ Usage: pc-agent [--config <path>]
        pc-agent install [--config <path>]
        pc-agent uninstall
        pc-agent diagnose [--config <path>]
+       pc-agent update --check [--channel stable|edge] [--config <path>]
 
 Publishes the state of this PC to Home Assistant over MQTT. The Windows
 service pc-agent runs it; in a console it runs until Ctrl+C.
@@ -57,6 +63,10 @@ Commands:
   diagnose         Print what each Windows source reads, once, then exit. It
                    publishes nothing: the MQTT check only connects and
                    disconnects. Run it as SYSTEM for the helper start test.
+  update --check   Check the release channel for a newer signed build and
+                   print the result. Installs nothing; needs no admin. The
+                   channel is --channel, else [update] channel of the config
+                   file, else stable.
 
 Options:
   --config <path>  Config file (default: C:\\ProgramData\\pc-agent\\config.toml)
@@ -94,6 +104,12 @@ enum Command {
         manifest: PathBuf,
         signature: PathBuf,
         public_key: PathBuf,
+    },
+    /// `update --check [--channel stable|edge]` (Windows: also
+    /// `[--config <path>]`).
+    UpdateCheck {
+        channel: Option<update::Channel>,
+        config: Option<PathBuf>,
     },
     Help,
 }
@@ -145,31 +161,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
                 }
                 return Ok(Command::Uninstall);
             }
-            "update" => {
-                let command = match (
-                    args.next().as_deref(),
-                    args.next(),
-                    args.next(),
-                    args.next(),
-                ) {
-                    (Some("--verify"), Some(manifest), Some(signature), Some(public_key)) => {
-                        Command::UpdateVerify {
-                            manifest: PathBuf::from(manifest),
-                            signature: PathBuf::from(signature),
-                            public_key: PathBuf::from(public_key),
-                        }
-                    }
-                    (Some("--verify"), ..) => {
-                        bail!("--verify needs <manifest> <signature> <public key file>")
-                    }
-                    (Some(other), ..) => bail!("unknown argument {other:?} after update"),
-                    (None, ..) => bail!("update needs --verify"),
-                };
-                if let Some(other) = args.next() {
-                    bail!("unknown argument {other:?} after update");
-                }
-                return Ok(command);
-            }
+            "update" => return update_args(args),
             "--config" => match args.next() {
                 Some(path) => config = PathBuf::from(path),
                 None => bail!("--config needs a path"),
@@ -178,6 +170,55 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
         }
     }
     Ok(Command::Run { config })
+}
+
+/// The arguments after `update`: `--verify <manifest> <signature> <public
+/// key file>`, or `--check [--channel stable|edge]` (Windows: also
+/// `[--config <path>]`) in any order.
+fn update_args(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let first = args.next();
+    if first.as_deref() == Some("--verify") {
+        return match (args.next(), args.next(), args.next(), args.next()) {
+            (_, _, _, Some(other)) => bail!("unknown argument {other:?} after update"),
+            (Some(manifest), Some(signature), Some(public_key), None) => {
+                Ok(Command::UpdateVerify {
+                    manifest: PathBuf::from(manifest),
+                    signature: PathBuf::from(signature),
+                    public_key: PathBuf::from(public_key),
+                })
+            }
+            _ => bail!("--verify needs <manifest> <signature> <public key file>"),
+        };
+    }
+    let mut check = false;
+    let mut channel = None;
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut config = None;
+    let mut next = first;
+    while let Some(arg) = next {
+        match arg.as_str() {
+            "--check" if !check => check = true,
+            "--channel" if channel.is_none() => {
+                let Some(name) = args.next() else {
+                    bail!("--channel needs stable or edge")
+                };
+                channel = Some(name.parse()?);
+            }
+            #[cfg(windows)]
+            "--config" if config.is_none() => {
+                let Some(path) = args.next() else {
+                    bail!("--config needs a path")
+                };
+                config = Some(PathBuf::from(path));
+            }
+            other => bail!("unknown argument {other:?} after update"),
+        }
+        next = args.next();
+    }
+    if !check {
+        bail!("update needs --check or --verify");
+    }
+    Ok(Command::UpdateCheck { channel, config })
 }
 
 /// The optional `--config <path>` after `command`, and nothing after it.
@@ -207,6 +248,10 @@ fn main() -> ExitCode {
             signature,
             public_key,
         }) => return update::verify_files(&manifest, &signature, &public_key),
+        Ok(Command::UpdateCheck { channel, config }) => {
+            let config = config.unwrap_or_else(|| PathBuf::from(config::DEFAULT_PATH));
+            return update::check_command(channel, &config);
+        }
         #[cfg(windows)]
         Ok(Command::SessionHelperProbe) => return sources::probe(),
         #[cfg(windows)]
@@ -473,6 +518,56 @@ mod tests {
         assert!(parse_args(args(&["update", "--verify", "m.json", "m.json.minisig"])).is_err());
         assert!(parse_args(args(&["update", "--verify", "m", "s", "k", "x"])).is_err());
         assert!(parse_args(args(&["update", "--bogus", "m", "s", "k"])).is_err());
+    }
+
+    #[test]
+    fn update_check_command() {
+        assert_eq!(
+            parse_args(args(&["update", "--check"])).unwrap(),
+            Command::UpdateCheck {
+                channel: None,
+                config: None
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["update", "--check", "--channel", "edge"])).unwrap(),
+            Command::UpdateCheck {
+                channel: Some(update::Channel::Edge),
+                config: None
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["update", "--channel", "stable", "--check"])).unwrap(),
+            Command::UpdateCheck {
+                channel: Some(update::Channel::Stable),
+                config: None
+            }
+        );
+        assert!(parse_args(args(&["update", "--check", "--channel"])).is_err());
+        assert!(parse_args(args(&["update", "--check", "--channel", "beta"])).is_err());
+        assert!(parse_args(args(&["update", "--check", "--check"])).is_err());
+        assert!(parse_args(args(&["update", "--check", "--bogus"])).is_err());
+        // Installing is U3: no `update` without --check yet.
+        assert!(parse_args(args(&["update", "--channel", "edge"])).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn update_check_takes_no_config_outside_windows() {
+        assert!(parse_args(args(&["update", "--check", "--config", "/tmp/c.toml"])).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn update_check_takes_a_config_on_windows() {
+        assert_eq!(
+            parse_args(args(&["update", "--check", "--config", r"D:\ci.toml"])).unwrap(),
+            Command::UpdateCheck {
+                channel: None,
+                config: Some(PathBuf::from(r"D:\ci.toml"))
+            }
+        );
+        assert!(parse_args(args(&["update", "--check", "--config"])).is_err());
     }
 
     #[test]

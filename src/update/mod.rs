@@ -1,7 +1,10 @@
-//! The signed release manifest of the self-update. No OS code: the download,
-//! the check and the install (U2 and later) build on `verify`.
+//! The signed release manifest of the self-update. No OS code: the check
+//! (`check`) and the install (U3 and later) build on `verify`.
 
+mod check;
 mod key;
+
+pub use check::{Channel, check_command};
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -27,7 +30,7 @@ pub struct Manifest {
     pub platforms: BTreeMap<String, Asset>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Asset {
     pub asset: String,
     pub sha256: String,
@@ -96,11 +99,11 @@ mod tests {
     use super::*;
     use key::PUBLIC_KEY;
 
-    const MANIFEST: &[u8] = include_bytes!("testdata/manifest.json");
-    const SIGNATURE: &str = include_str!("testdata/manifest.json.minisig");
+    pub(super) const MANIFEST: &[u8] = include_bytes!("testdata/manifest.json");
+    pub(super) const SIGNATURE: &str = include_str!("testdata/manifest.json.minisig");
     /// The public key of the throwaway test key that signed the fixture
     /// (`testdata/test.pub`).
-    const TEST_KEY: &str = "RWQ+2MlekOLCM8wYNdyQldq86IT7dyJ01dgZjWDbq+j8VH7zuIua3IiJ";
+    pub(super) const TEST_KEY: &str = "RWQ+2MlekOLCM8wYNdyQldq86IT7dyJ01dgZjWDbq+j8VH7zuIua3IiJ";
 
     #[test]
     fn a_signed_manifest_parses() {
