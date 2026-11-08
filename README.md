@@ -47,7 +47,38 @@ If a value in Home Assistant is wrong, run `sudo pc-agent diagnose` and keep the
 its 10 s input test. It prints what each source reads. It reads no configuration and prints no
 secret.
 
+An upgrade runs the same steps: `install.sh` keeps `/etc/pc-agent/config.toml`, so skip the edit
+and the restart. From 0.3.0 on, the agent updates itself (see `[update]` in Configuration); a manual install is
+needed only once, for a version older than 0.3.0.
+
 Uninstall: `sudo scripts/install.sh --uninstall` (keeps the configuration).
+
+### Windows (x86_64)
+
+Run PowerShell as administrator. The service must run from `C:\Program Files\pc-agent`: `install`
+registers the path of the running exe, and the self-update replaces the exe in that folder.
+
+```powershell
+New-Item -ItemType Directory -Force "C:\Program Files\pc-agent" | Out-Null
+cd "C:\Program Files\pc-agent"
+Invoke-WebRequest https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-windows.exe -OutFile pc-agent.exe
+Invoke-WebRequest https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-windows.exe.sha256 -OutFile pc-agent.exe.sha256
+(Get-FileHash pc-agent.exe).Hash -eq (Get-Content pc-agent.exe.sha256).Split(" ")[0].ToUpper()   # must print True
+.\pc-agent.exe install                                  # creates the service and C:\ProgramData\pc-agent
+notepad C:\ProgramData\pc-agent\config.toml             # set the broker and the device (see Configuration)
+Restart-Service pc-agent
+sc.exe qc pc-agent                                      # BINARY_PATH_NAME: C:\Program Files\pc-agent\pc-agent.exe
+```
+
+To move an existing install to this folder (or to upgrade from a version older than 0.3.0), download
+the exe as above, then run `.\pc-agent.exe uninstall` and `.\pc-agent.exe install` from
+`C:\Program Files\pc-agent`. `uninstall` removes only the service; the configuration stays. Then
+delete the old exe.
+
+If a value in Home Assistant is wrong, run `.\pc-agent.exe diagnose` as SYSTEM (for example with
+`psexec -s`). It prints what each Windows source reads and publishes nothing.
+
+Uninstall: `.\pc-agent.exe uninstall` (keeps `C:\ProgramData\pc-agent`).
 
 ### macOS (Apple silicon)
 
