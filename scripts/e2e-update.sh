@@ -7,18 +7,24 @@
 # Usage: bash scripts/e2e-update.sh
 # Needs sudo, cargo, minisign, mosquitto (broker and clients) and python3.
 #
-#   1. Makes a throwaway minisign key and builds the agent three times with
+#   1. Makes a throwaway minisign key and builds the agent four times with
 #      the test feature `update-test-key` (the key and the version are set
-#      at build time, PC_AGENT_UPDATE_URL at run time): 0.0.1, 0.0.2, and
-#      0.0.3 with `update-test-exit` (it exits after the pending-file check).
+#      at build time, PC_AGENT_UPDATE_URL at run time): 0.0.1, 0.0.2,
+#      0.0.3 with `update-test-exit` (it exits after the pending-file
+#      check), and 0.0.4.
 #   2. Runs a broker and a release server (the `stable` URLs) on 127.0.0.1.
-#   3. Installs 0.0.1 as the service; it must publish sw_version 0.0.1.
+#   3. Installs 0.0.1 as the service, with PC_AGENT_UPDATE_URL in its
+#      environment and `[update] auto = false`; it must publish sw_version
+#      0.0.1.
 #   4. Serves a signed manifest of 0.0.2 and runs `pc-agent update`: the
 #      service must publish sw_version 0.0.2, and the first ConnAck must
 #      delete update-pending.json and pc-agent.prev.
 #   5. Serves 0.0.3 and runs `pc-agent update`: after the third start with
 #      no ConnAck, 0.0.2 must be back at the binary path and publish again,
 #      and update-state.json must record the commit of 0.0.3 as failed.
+#   6. The HA update entity: its discovery config and its state. An
+#      `install` command on the command topic must not install the failed
+#      0.0.3, and must install 0.0.4 (with `auto` off) from the service.
 
 set -euo pipefail
 
@@ -31,6 +37,11 @@ url="http://127.0.0.1:$port"
 config_topic=homeassistant/sensor/CI-TEST/lastboot/config
 commit2=2222222222222222222222222222222222222222
 commit3=3333333333333333333333333333333333333333
+commit4=4444444444444444444444444444444444444444
+update_config=homeassistant/update/CI-TEST/agent/config
+update_state=homeassistant/update/CI-TEST/agent/state
+update_command=homeassistant/update/CI-TEST/agent/set
+dropin=/etc/systemd/system/pc-agent.service.d
 
 case "$(uname -s)" in
   Linux)
@@ -54,7 +65,7 @@ esac
 service_stop() {
   if [[ "$platform" == x86_64-linux ]]; then
     sudo systemctl stop pc-agent 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/pc-agent.service
+    sudo rm -rf /etc/systemd/system/pc-agent.service "$dropin"
     sudo systemctl daemon-reload
   else
     sudo launchctl bootout system/pc-agent 2>/dev/null || true
@@ -120,6 +131,7 @@ build() {
 build 0.0.1 update-test-key
 build 0.0.2 update-test-key
 build 0.0.3 update-test-key,update-test-exit
+build 0.0.4 update-test-key
 
 # 2. The broker and the release server.
 if [[ "$platform" == x86_64-linux ]]; then
@@ -193,13 +205,24 @@ entity_prefix = "ci_test"
 
 [gpu]
 enabled = false
+
+# The install command of step 6 must install also with auto off, and no
+# scheduled install can run during the test.
+[update]
+auto = false
 EOF
+# The service reads the URL of the test server (a build of the test feature only).
 if [[ "$platform" == x86_64-linux ]]; then
   sudo install -m 0644 "$root/packaging/pc-agent.service" /etc/systemd/system/pc-agent.service
+  sudo mkdir -p "$dropin"
+  printf '[Service]\nEnvironment=PC_AGENT_UPDATE_URL=%s\n' "$url" | sudo tee "$dropin/e2e.conf" > /dev/null
   sudo systemctl daemon-reload
   sudo systemctl start pc-agent
 else
-  sudo install -m 0644 "$root/packaging/pc-agent.plist" /Library/LaunchDaemons/pc-agent.plist
+  cp "$root/packaging/pc-agent.plist" "$work/pc-agent.plist"
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" \
+    -c "Add :EnvironmentVariables:PC_AGENT_UPDATE_URL string $url" "$work/pc-agent.plist"
+  sudo install -m 0644 "$work/pc-agent.plist" /Library/LaunchDaemons/pc-agent.plist
   sudo launchctl bootstrap system /Library/LaunchDaemons/pc-agent.plist
 fi
 wait_version 0.0.1 60
@@ -246,9 +269,65 @@ cmp -s "$bin" "$work/pc-agent-0.0.2" || fail "the binary is not 0.0.2 after the 
 wait_version 0.0.2 90
 echo "OK: 0.0.3 failed, 0.0.2 is back and the failed build is recorded"
 
-# The failed build is offered again only to a manual update (U4 adds the
-# automatic path); --check reports it.
+# The failed build is offered again only to a manual update; --check reports it.
 sudo env PC_AGENT_UPDATE_URL="$url" "$bin" update --check --channel stable | tee "$work/check.txt"
 grep -q "^newer build failed before: 0.0.3 commit $commit3" "$work/check.txt" \
   || fail "update --check does not report the failed build"
+
+# 6. The HA update entity and the install command.
+retained() {
+  mosquitto_sub -h 127.0.0.1 -t "$1" -C 1 -W 3 2>/dev/null || true
+}
+
+# The retained state of the update entity must contain the text $1.
+wait_state() {
+  local expected="$1" seconds="$2" got=""
+  for _ in $(seq 1 "$seconds"); do
+    got="$(retained "$update_state")"
+    [[ "$got" == *"$expected"* ]] && echo "update state: $got" && return 0
+    sleep 1
+  done
+  fail "the update state is '$got', expected $expected within $seconds s"
+}
+
+config="$(retained "$update_config")"
+echo "update config: $config"
+[[ "$config" == *'"device_class":"firmware"'* \
+  && "$config" == *"\"command_topic\":\"$update_command\""* \
+  && "$config" == *'"payload_install":"install"'* \
+  && "$config" == *'"unique_id":"pc-agent-pc-agent-CI-TEST-update"'* ]] \
+  || fail "the update discovery config is not as expected"
+# Before a check: up to date (JSON keys in sorted order).
+wait_state '"installed_version":"0.0.2","latest_version":"0.0.2"' 30
+
+# The failed 0.0.3 is still the release: the command checks, does not
+# install it, shows "up to date" and names the failed build in the summary.
+mosquitto_pub -h 127.0.0.1 -t "$update_command" -m install
+wait_state '"release_summary":"Build 0.0.3 failed before' 60
+sleep 5
+cmp -s "$bin" "$work/pc-agent-0.0.2" || fail "the install command installed the failed build"
+wait_state '"in_progress":false,"installed_version":"0.0.2","latest_version":"0.0.2"' 5
+echo "OK: the install command does not install a failed build"
+
+# A new release: the command installs it from the service (auto is off).
+release 0.0.4 "$commit4" "$work/pc-agent-0.0.4"
+mosquitto_pub -h 127.0.0.1 -t "$update_command" -m install
+wait_state '"installed_version":"0.0.4"' 120
+cmp -s "$bin" "$work/pc-agent-0.0.4" || fail "the binary is not 0.0.4 after the install command"
+wait_version 0.0.4 30
+confirmed=false
+for _ in $(seq 1 30); do
+  if ! sudo test -e "$state/update-pending.json" && ! test -e "$bin.prev"; then
+    confirmed=true
+    break
+  fi
+  sleep 1
+done
+$confirmed || fail "update-pending.json or pc-agent.prev is still there after the install command"
+sudo cat "$state/update-state.json"
+sudo grep -q '"last_check"' "$state/update-state.json" || fail "update-state.json has no last_check"
+if sudo grep -q '"last_auto_install"' "$state/update-state.json"; then
+  fail "an install from HA was recorded as an automatic install"
+fi
+echo "OK: the install command installed 0.0.4 from the service"
 echo "The update end-to-end test passed."

@@ -21,7 +21,6 @@ pub struct Config {
     #[serde(default)]
     pub gpu: Gpu,
     #[serde(default)]
-    #[allow(dead_code)] // The schedule (U4) reads it.
     pub update: Update,
 }
 
@@ -74,7 +73,6 @@ impl Default for Gpu {
 #[derive(Debug, Deserialize)]
 pub struct Update {
     #[serde(default = "enabled_default")]
-    #[allow(dead_code)] // The schedule (U4) reads it.
     pub auto: bool,
     #[serde(default)]
     pub channel: Channel,

@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::core::{Core, Snapshot, State, SystemEvent};
 use crate::entities::{self, Entity};
-use crate::update::Watch;
+use crate::update::{Step, Updater, Watch};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// Capacity of the request channel. Larger than the burst of one connect, so
@@ -29,8 +29,8 @@ pub const OFFLINE: &str = "offline";
 pub enum Exit {
     /// `stop` completed: the agent published `offline` and disconnected.
     Stopped,
-    /// The service must start again (the rollback of an update; U4 adds the
-    /// restart after an install): a clean DISCONNECT with no `offline`, so
+    /// The service must start again (the rollback of an update, or the
+    /// install of an update): a clean DISCONNECT with no `offline`, so
     /// HA keeps `online`, and the caller exits so that the service manager
     /// starts the binary at the binary path.
     Restart,
@@ -77,14 +77,17 @@ pub fn diagnose_options(cfg: &Config) -> MqttOptions {
 }
 
 /// The messages of each (re)connect: the discovery configs of the supplied
-/// entities, an empty (retained) config for each entity of the table that is
-/// not supplied, so HA removes a stale entity, then `online`, then the given
-/// states. Outside Windows, a Windows-only entity gets no empty config.
+/// entities and of the `update` entity (every OS supplies it), an empty
+/// (retained) config for each entity of the table that is not supplied, so
+/// HA removes a stale entity, then `online`, then the given states and the
+/// state of the `update` entity. Outside Windows, a Windows-only entity gets
+/// no empty config.
 pub fn connect_messages(
     cfg: &Config,
     model: &str,
     supplied: &[&Entity],
     states: &[(&Entity, String)],
+    update_state: String,
 ) -> Vec<Message> {
     let device = &cfg.device.name;
     let mut msgs: Vec<Message> = supplied
@@ -94,6 +97,10 @@ pub fn connect_messages(
             payload: entities::discovery_payload(cfg, e, model).to_string(),
         })
         .collect();
+    msgs.push(Message {
+        topic: entities::update_config_topic(device),
+        payload: entities::update_discovery_payload(cfg, model).to_string(),
+    });
     msgs.extend(
         entities::ENTITIES
             .iter()
@@ -110,7 +117,15 @@ pub fn connect_messages(
             .iter()
             .map(|(entity, value)| state_message(cfg, entity, value.clone())),
     );
+    msgs.push(update_state_message(cfg, update_state));
     msgs
+}
+
+fn update_state_message(cfg: &Config, payload: String) -> Message {
+    Message {
+        topic: entities::update_state_topic(&cfg.device.name),
+        payload,
+    }
 }
 
 fn state_message(cfg: &Config, entity: &Entity, payload: String) -> Message {
@@ -366,6 +381,8 @@ impl Session {
 /// events. `ack_wait` is the longest wait for the ack of `offline`. The
 /// first ConnAck confirms a pending update of `watch`; with no ConnAck
 /// before its deadline, `watch` rolls back and the loop ends with a restart.
+/// While connected, `updater` checks for updates on its schedule and on the
+/// install command; after an install the loop ends with a restart.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<P, F>(
     cfg: &Config,
@@ -376,6 +393,7 @@ pub async fn run<P, F>(
     ack_wait: Duration,
     stop: F,
     watch: &mut Watch,
+    mut updater: Updater,
 ) -> Result<Exit>
 where
     P: FnMut() -> Snapshot,
@@ -401,8 +419,11 @@ where
     let mut retry_at: Option<tokio::time::Instant> = None;
     let mut suspend = SuspendWait::new(ack_wait);
     let mut pause = Pause::default();
+    let command_topic = entities::update_command_topic(&cfg.device.name);
 
     let exit = loop {
+        // Before the select: the branch of the update job borrows `updater`.
+        let check_at = updater.next_check();
         tokio::select! {
             _ = &mut stop => break Exit::Stopped,
             _ = tokio::time::sleep_until(watch.deadline().unwrap_or_else(tokio::time::Instant::now)),
@@ -413,6 +434,18 @@ where
             }
             _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)),
                 if retry_at.is_some() => retry_at = None,
+            // A check that is due while disconnected runs after the next ConnAck.
+            _ = tokio::time::sleep_until(check_at.unwrap_or_else(tokio::time::Instant::now)),
+                if connected && check_at.is_some() => updater.on_timer(tokio::time::Instant::now(), chrono::Utc::now()),
+            done = updater.job_done(), if updater.busy() => {
+                let step = updater.on_job_done(done, chrono::Utc::now());
+                if connected {
+                    session.publish(update_state_message(cfg, updater.state_payload()));
+                }
+                if step == Step::Restart {
+                    break Exit::Restart;
+                }
+            }
             _ = poll_tick.tick(), if connected && pause.tick_allowed() => {
                 let states = core.update(poll(), Instant::now());
                 if connected {
@@ -455,9 +488,19 @@ where
                     // The tick was off while disconnected: take a fresh snapshot.
                     core.update(poll(), Instant::now());
                     let states = core.connect(Instant::now());
-                    for msg in connect_messages(cfg, model, core.supplied(), &states) {
+                    let update_state = updater.state_payload();
+                    for msg in connect_messages(cfg, model, core.supplied(), &states, update_state) {
                         session.publish(msg);
                     }
+                    // A clean session: subscribe at each connect.
+                    if let Err(e) = session.client.try_subscribe(&command_topic, QoS::AtLeastOnce) {
+                        warn!(topic = %command_topic, error = %e, "cannot subscribe");
+                    }
+                }
+                Ok(Event::Incoming(Incoming::Publish(p))) if p.topic == command_topic => {
+                    // A retained command is old (the broker sends it at the
+                    // subscribe): only a live `install` checks.
+                    updater.on_command(&p.payload, p.retain);
                 }
                 Ok(event) => {
                     session.record(&event);
@@ -585,11 +628,14 @@ enabled = false
                 (&entities::LASTBOOT, "2026-08-28 04:54:55Z".to_string()),
                 (&entities::SESSIONSTATE, "Unknown".to_string()),
             ],
+            "{\"installed_version\":\"0.3.0\"}".to_string(),
         );
         let topics: Vec<&str> = msgs.iter().map(|m| m.topic.as_str()).collect();
         let mut expected = vec![
             "homeassistant/sensor/JAHURTX-TEST/lastboot/config",
             "homeassistant/sensor/JAHURTX-TEST/sessionstate/config",
+            // Every OS supplies the update entity.
+            "homeassistant/update/JAHURTX-TEST/agent/config",
             // The entities of the table that are not supplied, in table order.
             "homeassistant/sensor/JAHURTX-TEST/lastactive/config",
             "homeassistant/sensor/JAHURTX-TEST/lastsystemstatechange/config",
@@ -607,32 +653,38 @@ enabled = false
             "homeassistant/sensor/JAHURTX-TEST/availability",
             "homeassistant/sensor/JAHURTX-TEST/lastboot/state",
             "homeassistant/sensor/JAHURTX-TEST/sessionstate/state",
+            "homeassistant/update/JAHURTX-TEST/agent/state",
         ]);
         assert_eq!(topics, expected);
-        for m in &msgs[2..empty] {
+        for m in &msgs[3..empty] {
             assert_eq!(m.payload, "", "{}", m.topic);
         }
         assert_eq!(msgs[empty].payload, "online");
         assert_eq!(msgs[empty + 1].payload, "2026-08-28 04:54:55Z");
         assert_eq!(msgs[empty + 2].payload, "Unknown");
+        assert_eq!(msgs[empty + 3].payload, "{\"installed_version\":\"0.3.0\"}");
         let config: serde_json::Value = serde_json::from_str(&msgs[0].payload).unwrap();
         assert_eq!(config["name"], "lastboot");
         assert_eq!(config["device"]["model"], "3.1.0");
+        let update: serde_json::Value = serde_json::from_str(&msgs[2].payload).unwrap();
+        assert_eq!(update["device_class"], "firmware");
+        assert_eq!(update["device"]["model"], "3.1.0");
     }
 
     #[test]
     fn all_entities_supplied_gives_no_empty_config() {
         let cfg = Config::parse(CFG).unwrap();
         let all: Vec<&Entity> = entities::ENTITIES.iter().collect();
-        let msgs = connect_messages(&cfg, "3.1.0", &all, &[]);
-        assert_eq!(msgs.len(), entities::ENTITIES.len() + 1);
+        let msgs = connect_messages(&cfg, "3.1.0", &all, &[], "{}".to_string());
+        // The configs, the update config, online and the update state.
+        assert_eq!(msgs.len(), entities::ENTITIES.len() + 3);
         assert!(msgs.iter().all(|m| !m.payload.is_empty()));
     }
 
     #[test]
     fn empty_configs_stay_in_the_config_topics_of_this_device() {
         let cfg = Config::parse(CFG).unwrap();
-        let msgs = connect_messages(&cfg, "3.1.0", &[], &[]);
+        let msgs = connect_messages(&cfg, "3.1.0", &[], &[], "{}".to_string());
         let empty: Vec<&Message> = msgs.iter().filter(|m| m.payload.is_empty()).collect();
         let clearable = entities::ENTITIES
             .iter()
@@ -659,7 +711,7 @@ enabled = false
         for gpu in [true, false] {
             let supplied = crate::sources::supplied(gpu);
             assert!(!supplied.iter().any(|e| e.windows_only));
-            let msgs = connect_messages(&cfg, "3.1.0", supplied, &[]);
+            let msgs = connect_messages(&cfg, "3.1.0", supplied, &[], "{}".to_string());
             assert!(
                 !msgs.iter().any(|m| m.topic.contains("/inputhelper/")),
                 "{:?}",
@@ -950,6 +1002,7 @@ enabled = false
             Duration::from_secs(2),
             std::future::pending::<()>(),
             &mut watch,
+            Updater::disabled(crate::update::Channel::Stable),
         )
         .await
         .unwrap();

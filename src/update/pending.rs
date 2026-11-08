@@ -86,12 +86,17 @@ impl Pending {
     }
 }
 
-/// `update-state.json`: the builds that failed after an install. U4 adds
-/// the times of the last check and of the last automatic install.
+/// `update-state.json`: the builds that failed after an install, and the
+/// times (UTC, RFC 3339) of the last check and of the last automatic install
+/// of the service schedule.
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct UpdateState {
     #[serde(default)]
     pub failed: Vec<BuildId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_auto_install: Option<String>,
 }
 
 impl UpdateState {
@@ -287,6 +292,13 @@ pub fn write_pending(paths: &Paths, pending: &Pending) -> Result<()> {
 /// `update-state.json`, or the empty state when it does not exist.
 pub fn read_state(paths: &Paths) -> Result<UpdateState> {
     Ok(read_json(&paths.state())?.unwrap_or_default())
+}
+
+/// Writes `update-state.json` (the state folder is created when missing).
+pub fn write_state(paths: &Paths, state: &UpdateState) -> Result<()> {
+    fs::create_dir_all(&paths.state_dir)
+        .with_context(|| format!("cannot create {}", paths.state_dir.display()))?;
+    write_json(&paths.state(), state)
 }
 
 /// The pending-file check, the first step of the service path: adds 1 to

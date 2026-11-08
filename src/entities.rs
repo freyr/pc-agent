@@ -149,6 +149,58 @@ pub fn state_topic(device: &str, entity: &Entity) -> String {
     )
 }
 
+/// The device block of every discovery configuration.
+fn device_block(cfg: &Config, model: &str) -> Value {
+    json!({
+        "identifiers": cfg.device.identifier,
+        "name": cfg.device.name,
+        "manufacturer": "pc-agent",
+        "model": model,
+        "sw_version": crate::update::VERSION,
+    })
+}
+
+/// The payload of the command topic of the update entity that installs.
+pub const UPDATE_INSTALL: &str = "install";
+
+/// The topics of the HA `update` entity of the agent itself:
+/// `homeassistant/update/<device name>/agent/<leaf>`. It is not in
+/// `ENTITIES`: no source supplies it, every agent publishes it.
+fn update_topic(device: &str, leaf: &str) -> String {
+    format!("homeassistant/update/{device}/agent/{leaf}")
+}
+
+pub fn update_config_topic(device: &str) -> String {
+    update_topic(device, "config")
+}
+
+pub fn update_state_topic(device: &str) -> String {
+    update_topic(device, "state")
+}
+
+pub fn update_command_topic(device: &str) -> String {
+    update_topic(device, "set")
+}
+
+/// The MQTT discovery configuration of the `update` entity. The `unique_id`
+/// comes from the device identifier, so both OSes of a dual-boot PC give the
+/// same entity.
+pub fn update_discovery_payload(cfg: &Config, model: &str) -> Value {
+    let device = &cfg.device.name;
+    json!({
+        "name": "agent",
+        "unique_id": format!("pc-agent-{}-update", cfg.device.identifier),
+        "default_entity_id": format!("update.{}_agent", cfg.device.entity_prefix),
+        "device_class": "firmware",
+        "entity_category": "config",
+        "state_topic": update_state_topic(device),
+        "command_topic": update_command_topic(device),
+        "payload_install": UPDATE_INSTALL,
+        "availability_topic": availability_topic(device),
+        "device": device_block(cfg, model),
+    })
+}
+
 /// The MQTT discovery configuration of one entity. `model` is the device model
 /// that the OS module of `sources` gives.
 pub fn discovery_payload(cfg: &Config, entity: &Entity, model: &str) -> Value {
@@ -159,13 +211,7 @@ pub fn discovery_payload(cfg: &Config, entity: &Entity, model: &str) -> Value {
         "state_topic": state_topic(device, entity),
         "availability_topic": availability_topic(device),
         "icon": entity.icon,
-        "device": {
-            "identifiers": cfg.device.identifier,
-            "name": device,
-            "manufacturer": "pc-agent",
-            "model": model,
-            "sw_version": crate::update::VERSION,
-        },
+        "device": device_block(cfg, model),
     });
     if let Some(class) = entity.device_class {
         payload["device_class"] = json!(class);
@@ -434,6 +480,47 @@ lastsystemstatechange = "6e2d5760-f4a1-4351-9548-299067464890"
             assert_eq!(d["model"], "3.1.0");
             assert_eq!(d["sw_version"], crate::update::VERSION);
         }
+    }
+
+    #[test]
+    fn the_update_entity_is_a_firmware_update_with_an_install_command() {
+        let cfg = Config::parse(JAHURTX).unwrap();
+        let v = update_discovery_payload(&cfg, MODEL);
+        assert_eq!(
+            keys(&v),
+            [
+                "availability_topic",
+                "command_topic",
+                "default_entity_id",
+                "device",
+                "device_class",
+                "entity_category",
+                "name",
+                "payload_install",
+                "state_topic",
+                "unique_id"
+            ]
+        );
+        // From the device identifier: the same on both OSes of a dual-boot PC.
+        assert_eq!(v["unique_id"], "pc-agent-hass.agent-JAHURTX-update");
+        assert_eq!(v["default_entity_id"], "update.jahu_rtx_agent");
+        assert_eq!(v["device_class"], "firmware");
+        assert_eq!(v["entity_category"], "config");
+        assert_eq!(v["payload_install"], "install");
+        assert_eq!(v["state_topic"], "homeassistant/update/JAHURTX/agent/state");
+        assert_eq!(v["command_topic"], "homeassistant/update/JAHURTX/agent/set");
+        assert_eq!(
+            v["availability_topic"],
+            "homeassistant/sensor/JAHURTX/availability"
+        );
+        assert_eq!(
+            v["device"],
+            discovery_payload(&cfg, &LASTBOOT, MODEL)["device"]
+        );
+        assert_eq!(
+            update_config_topic("JAHURTX"),
+            "homeassistant/update/JAHURTX/agent/config"
+        );
     }
 
     #[test]
