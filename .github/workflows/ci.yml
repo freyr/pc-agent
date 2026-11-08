@@ -57,9 +57,10 @@ jobs:
             dist/pc-agent-*-macos.pkg.sha256
           if-no-files-found: error
 
-  # The runner has no interactive session and no NVIDIA GPU. The job installs
-  # the service, runs it against a local broker and removes it. The GPU is on
-  # in the test configuration, so the NVML failure path runs.
+  # The runner has no NVIDIA GPU; it has a console session (runneradmin). The
+  # job installs the service, runs it against a local broker and removes it,
+  # then runs diagnose. The GPU is on in the test configuration, so the NVML
+  # failure path runs.
   windows:
     runs-on: windows-latest
     timeout-minutes: 30
@@ -258,6 +259,66 @@ jobs:
           }
           if (-not $gone) { throw "the service pc-agent still exists" }
           if (-not (Test-Path C:\ProgramData\pc-agent\config.toml)) { throw "uninstall removed the configuration" }
+          $global:LASTEXITCODE = 0
+
+      # After the uninstall, so diagnose cannot disturb the service checks;
+      # the retained availability is now offline and must stay offline.
+      - name: Run diagnose as runneradmin
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $cfg = Join-Path $env:RUNNER_TEMP "ci-config.toml"
+          $out = .\target\release\pc-agent.exe diagnose --config $cfg 2>&1
+          $code = $LASTEXITCODE
+          $out
+          if ($code -ne 0) { throw "pc-agent diagnose ended with exit code $code" }
+          if (-not ($out | Select-String -SimpleMatch '== End of diagnose')) { throw "no end marker" }
+          # runneradmin is not LocalSystem: no SE_TCB_NAME for WTSQueryUserToken.
+          if (-not ($out | Select-String -SimpleMatch 'helper: WTSQueryUserToken failed: 1314 (not running as SYSTEM)')) { throw "the helper line does not report the WTSQueryUserToken failure" }
+          if (-not ($out | Select-String -SimpleMatch 'MQTT: connected to 127.0.0.1:1883')) { throw "the MQTT check did not connect" }
+          $global:LASTEXITCODE = 0
+
+      - name: Run diagnose as SYSTEM and check that it publishes nothing
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $exe = (Resolve-Path .\target\release\pc-agent.exe).Path
+          $dir = 'C:\ProgramData\pc-agent'
+          $out = "$dir\diagnose.txt"
+          Remove-Item $out -ErrorAction SilentlyContinue
+          # GitHub runs the steps as runneradmin, so a scheduled task runs
+          # diagnose as SYSTEM, with the configuration that install copied.
+          @"
+          @echo off
+          $exe diagnose --config $dir\config.toml > $out 2>&1
+          echo exit code %ERRORLEVEL% >> $out
+          "@ | Set-Content -Path "$dir\diagnose.cmd" -Encoding ascii
+          schtasks /Create /TN pcagent-diag /RU SYSTEM /SC ONCE /ST 00:00 /F /TR "$dir\diagnose.cmd"
+          if ($LASTEXITCODE -ne 0) { throw "schtasks /Create failed" }
+          schtasks /Run /TN pcagent-diag
+          if ($LASTEXITCODE -ne 0) { throw "schtasks /Run failed" }
+          $text = ''
+          foreach ($i in 1..60) {
+            # The file can be open in cmd while diagnose writes it.
+            if (Test-Path $out) { $text = Get-Content $out -Raw -ErrorAction SilentlyContinue }
+            if ($text -match 'exit code \d+') { break }
+            Start-Sleep -Seconds 1
+          }
+          schtasks /Delete /TN pcagent-diag /F | Out-Null
+          $text
+          if ($text -notmatch 'exit code 0') { throw "diagnose as SYSTEM did not end with exit code 0 within 60 s" }
+          if (-not $text.Contains('== End of diagnose')) { throw "no end marker" }
+          # The runner has a console session (runneradmin).
+          if (-not $text.Contains('helper: started in session')) { throw "the helper did not start in the console session" }
+          if (-not $text.Contains('MQTT: connected to 127.0.0.1:1883')) { throw "the MQTT check did not connect" }
+          # No last will and no publish: the availability is still what the
+          # service left, and the broker got no PUBLISH from diagnose.
+          $availability = & $env:MQTT_READ 'homeassistant/sensor/CI-TEST/availability' 20
+          "availability: $availability"
+          if ($availability -ne 'offline') { throw "diagnose changed the availability to '$availability'" }
+          $log = Join-Path $env:RUNNER_TEMP "mosquitto.log"
+          $lines = @(Select-String -Path $log -SimpleMatch 'pc-agent-diagnose-CI-TEST')
+          $lines | ForEach-Object { $_.Line }
+          if ($lines.Count -eq 0) { throw "the broker log has no connect of pc-agent-diagnose-CI-TEST" }
+          if ($lines | Where-Object { $_.Line -match 'PUBLISH from pc-agent-diagnose' }) { throw "diagnose published a message" }
           $global:LASTEXITCODE = 0
 
       - name: Show the logs

@@ -42,6 +42,7 @@ const USAGE: &str = "\
 Usage: pc-agent [--config <path>]
        pc-agent install [--config <path>]
        pc-agent uninstall
+       pc-agent diagnose [--config <path>]
 
 Publishes the state of this PC to Home Assistant over MQTT. The Windows
 service pc-agent runs it; in a console it runs until Ctrl+C.
@@ -52,6 +53,9 @@ Commands:
                    C:\\ProgramData\\pc-agent\\config.toml; without it, write the
                    example configuration there if no config.toml exists.
   uninstall        Stop and delete the service. The configuration stays.
+  diagnose         Print what each Windows source reads, once, then exit. It
+                   publishes nothing: the MQTT check only connects and
+                   disconnects. Run it as SYSTEM for the helper start test.
 
 Options:
   --config <path>  Config file (default: C:\\ProgramData\\pc-agent\\config.toml)
@@ -64,13 +68,19 @@ enum Command {
     Run {
         config: PathBuf,
     },
-    Diagnose,
+    Diagnose {
+        config: Option<PathBuf>,
+    },
     #[cfg(windows)]
     Install {
         config: Option<PathBuf>,
     },
     #[cfg(windows)]
     Uninstall,
+    /// `session-helper --probe` (not in the help): one read in the user
+    /// session, for `diagnose`.
+    #[cfg(windows)]
+    SessionHelperProbe,
     Help,
 }
 
@@ -80,24 +90,32 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
+            #[cfg(not(windows))]
             "diagnose" => {
                 if let Some(other) = args.next() {
                     bail!("unknown argument {other:?} after diagnose");
                 }
-                return Ok(Command::Diagnose);
+                return Ok(Command::Diagnose { config: None });
+            }
+            #[cfg(windows)]
+            "diagnose" => {
+                let config = config_arg(&mut args, "diagnose")?;
+                return Ok(Command::Diagnose { config });
             }
             #[cfg(windows)]
             "install" => {
-                let config = match (args.next().as_deref(), args.next()) {
-                    (None, _) => None,
-                    (Some("--config"), Some(path)) => Some(PathBuf::from(path)),
-                    (Some("--config"), None) => bail!("--config needs a path"),
-                    (Some(other), _) => bail!("unknown argument {other:?} after install"),
-                };
-                if let Some(other) = args.next() {
-                    bail!("unknown argument {other:?} after install");
-                }
+                let config = config_arg(&mut args, "install")?;
                 return Ok(Command::Install { config });
+            }
+            #[cfg(windows)]
+            "session-helper" => {
+                if args.next().as_deref() != Some("--probe") {
+                    bail!("session-helper needs --probe");
+                }
+                if let Some(other) = args.next() {
+                    bail!("unknown argument {other:?} after session-helper --probe");
+                }
+                return Ok(Command::SessionHelperProbe);
             }
             #[cfg(windows)]
             "uninstall" => {
@@ -116,13 +134,30 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
     Ok(Command::Run { config })
 }
 
+/// The optional `--config <path>` after `command`, and nothing after it.
+#[cfg(windows)]
+fn config_arg(args: &mut impl Iterator<Item = String>, command: &str) -> Result<Option<PathBuf>> {
+    let config = match (args.next().as_deref(), args.next()) {
+        (None, _) => None,
+        (Some("--config"), Some(path)) => Some(PathBuf::from(path)),
+        (Some("--config"), None) => bail!("--config needs a path"),
+        (Some(other), _) => bail!("unknown argument {other:?} after {command}"),
+    };
+    if let Some(other) = args.next() {
+        bail!("unknown argument {other:?} after {command}");
+    }
+    Ok(config)
+}
+
 fn main() -> ExitCode {
     let config_path = match parse_args(std::env::args().skip(1)) {
         Ok(Command::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Ok(Command::Diagnose) => return diagnose(),
+        Ok(Command::Diagnose { config }) => return diagnose(config),
+        #[cfg(windows)]
+        Ok(Command::SessionHelperProbe) => return sources::probe(),
         #[cfg(windows)]
         Ok(Command::Install { config }) => return sources::install(config.as_deref()),
         #[cfg(windows)]
@@ -153,14 +188,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// `pc-agent diagnose`: runs the checks of the OS source once.
-fn diagnose() -> ExitCode {
+/// `pc-agent diagnose`: runs the checks of the OS source once. Only the
+/// Windows checks read the configuration (for the MQTT check).
+fn diagnose(config: Option<PathBuf>) -> ExitCode {
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => {
-            runtime.block_on(sources::diagnose());
+            #[cfg(windows)]
+            runtime.block_on(sources::diagnose(config.as_deref()));
+            #[cfg(not(windows))]
+            {
+                let _ = config;
+                runtime.block_on(sources::diagnose());
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -266,8 +308,42 @@ mod tests {
 
     #[test]
     fn diagnose_command() {
-        assert_eq!(parse_args(args(&["diagnose"])).unwrap(), Command::Diagnose);
+        assert_eq!(
+            parse_args(args(&["diagnose"])).unwrap(),
+            Command::Diagnose { config: None }
+        );
         assert!(parse_args(args(&["diagnose", "--bogus"])).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn diagnose_takes_no_config_outside_windows() {
+        assert!(parse_args(args(&["diagnose", "--config", "/tmp/c.toml"])).is_err());
+        assert!(parse_args(args(&["session-helper", "--probe"])).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnose_takes_a_config_on_windows() {
+        assert_eq!(
+            parse_args(args(&["diagnose", "--config", r"D:\ci.toml"])).unwrap(),
+            Command::Diagnose {
+                config: Some(PathBuf::from(r"D:\ci.toml"))
+            }
+        );
+        assert!(parse_args(args(&["diagnose", "--config"])).is_err());
+        assert!(parse_args(args(&["diagnose", "--config", "a", "b"])).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn session_helper_probe_command() {
+        assert_eq!(
+            parse_args(args(&["session-helper", "--probe"])).unwrap(),
+            Command::SessionHelperProbe
+        );
+        assert!(parse_args(args(&["session-helper"])).is_err());
+        assert!(parse_args(args(&["session-helper", "--probe", "x"])).is_err());
     }
 
     #[cfg(windows)]

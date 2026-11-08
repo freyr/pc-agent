@@ -1,8 +1,11 @@
 //! The Windows sources and the service frame. The service reads the boot
 //! time, the console session, the session list, the display state and the
 //! GPU, and turns the session and power controls into events; the later
-//! tasks add the helper sources.
+//! tasks add the helper sources. `pc-agent session-helper --probe` is the
+//! one read of the helper that `diagnose` starts.
 
+mod diagnose;
+mod helper;
 mod install;
 mod service;
 mod wts;
@@ -17,6 +20,7 @@ use super::wts_rules::DisplayCell;
 use crate::core::{Snapshot, SystemEvent};
 use crate::entities::{self, Entity};
 
+pub use helper::probe;
 pub use install::{install, uninstall};
 pub use service::run_as_service;
 
@@ -84,9 +88,10 @@ pub fn poll(gpu: bool) -> Snapshot {
     }
 }
 
-/// `pc-agent diagnose`: the checks are for Linux only.
-pub async fn diagnose() {
-    println!("diagnose is for Linux");
+/// `pc-agent diagnose [--config <path>]`: prints the reads of each source
+/// once and publishes nothing.
+pub async fn diagnose(config: Option<&std::path::Path>) {
+    diagnose::run(config).await;
 }
 
 /// The receiver of the session, sleep, wake and shutdown events of the

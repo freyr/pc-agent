@@ -42,12 +42,30 @@ pub fn sample() -> Option<GpuSample> {
 /// For `diagnose`: one init and one query of GPU 0, as (name, load, power).
 #[cfg(target_os = "linux")]
 pub fn check() -> Result<(String, u32, Result<f64, String>), String> {
-    let nvml = init()?;
+    device_check(&init()?)
+}
+
+/// For `diagnose` on Windows: the library that opened and one query of
+/// GPU 0, or the error of each library.
+#[cfg(windows)]
+pub fn check() -> Result<
+    (
+        &'static str,
+        Result<super::win_diagnose::NvmlDevice, String>,
+    ),
+    String,
+> {
+    let (nvml, lib) = open_first(&WINDOWS_LIBS, open_windows)?;
+    Ok((lib, device_check(&nvml)))
+}
+
+/// The name of GPU 0 and one query of it.
+fn device_check(nvml: &Nvml) -> Result<(String, u32, Result<f64, String>), String> {
     let name = nvml
         .device_by_index(0)
         .and_then(|d| d.name())
         .map_err(|e| e.to_string())?;
-    let (load, power) = query(&nvml)?;
+    let (load, power) = query(nvml)?;
     Ok((name, load, power))
 }
 
@@ -58,25 +76,28 @@ fn init() -> Result<Nvml, String> {
 
 #[cfg(windows)]
 fn init() -> Result<Nvml, String> {
-    open_first(&WINDOWS_LIBS, |lib| {
-        Nvml::builder()
-            .lib_path(std::ffi::OsStr::new(lib))
-            .init()
-            .map_err(|e| e.to_string())
-    })
+    open_first(&WINDOWS_LIBS, open_windows).map(|(nvml, _)| nvml)
 }
 
-/// The handle of the first library in `libs` that `open` opens. When all
-/// fail, the error names each library and its error.
+#[cfg(windows)]
+fn open_windows(lib: &str) -> Result<Nvml, String> {
+    Nvml::builder()
+        .lib_path(std::ffi::OsStr::new(lib))
+        .init()
+        .map_err(|e| e.to_string())
+}
+
+/// The handle of the first library in `libs` that `open` opens, with that
+/// library. When all fail, the error names each library and its error.
 #[cfg(any(windows, test))]
-fn open_first<H>(
-    libs: &[&str],
+fn open_first<'a, H>(
+    libs: &[&'a str],
     mut open: impl FnMut(&str) -> Result<H, String>,
-) -> Result<H, String> {
+) -> Result<(H, &'a str), String> {
     let mut errors = Vec::new();
     for lib in libs {
         match open(lib) {
-            Ok(handle) => return Ok(handle),
+            Ok(handle) => return Ok((handle, lib)),
             Err(e) => errors.push(format!("{lib}: {e}")),
         }
     }
@@ -223,7 +244,8 @@ mod tests {
                 Err("not found".to_string())
             }
         });
-        assert_eq!(handle, Ok(WINDOWS_LIBS[1].len()));
+        // The handle comes with the library that opened it.
+        assert_eq!(handle, Ok((WINDOWS_LIBS[1].len(), WINDOWS_LIBS[1])));
         assert_eq!(tried, WINDOWS_LIBS[..2]);
         assert_eq!(WINDOWS_LIBS[0], "nvml.dll");
         assert!(WINDOWS_LIBS[2].ends_with(r"System32\nvml.dll"));
