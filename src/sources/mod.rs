@@ -5,6 +5,14 @@
 //! module also gives the service frame: `run_as_service`, `install` and
 //! `uninstall`.
 
+/// The wait of the core for the broker's ack of `offline` before sleep,
+/// shutdown or stop. Windows allows about 2 s for the suspend handler, which
+/// blocks for this wait, so the wait is shorter there.
+#[cfg(windows)]
+pub const ACK_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+#[cfg(not(windows))]
+pub const ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

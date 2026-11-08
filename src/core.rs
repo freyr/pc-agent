@@ -76,7 +76,8 @@ pub struct Snapshot {
 pub enum SystemEvent {
     /// The system goes to sleep. The core publishes the `Suspend` state and
     /// `offline`, then completes `done` when the broker has acknowledged
-    /// `offline`, after 2 s without the ack, or at once when not connected.
+    /// `offline`, after the ack wait (`sources::ACK_WAIT`) without the ack,
+    /// or at once when not connected.
     Suspend { done: oneshot::Sender<()> },
     /// The system woke up.
     Resume,
@@ -86,6 +87,10 @@ pub enum SystemEvent {
     Shutdown { done: oneshot::Sender<()> },
     /// The shutdown was cancelled: `online` again, no `lastsystemstatechange`.
     ShutdownCancelled,
+    /// A session was locked, unlocked, logged on or logged off: the core
+    /// takes a snapshot at once, as the 2 s tick does, so the session events
+    /// that `update` derives go out without the wait for the tick.
+    SessionChange,
 }
 
 /// The current state of the supplied entities.

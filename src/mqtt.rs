@@ -16,7 +16,6 @@ const KEEP_ALIVE: Duration = Duration::from_secs(30);
 /// `try_publish` from the task that polls the event loop never fails for a full channel.
 const CHANNEL_CAP: usize = 64;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
-const OFFLINE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// The interval at which the source gives a snapshot.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -136,6 +135,8 @@ fn handle_event(
             publish(availability_message(cfg, ONLINE));
             None
         }
+        // The run loop takes the snapshot of a session change.
+        SystemEvent::SessionChange => None,
     }
 }
 
@@ -157,6 +158,7 @@ impl Pause {
             SystemEvent::Resume => self.asleep = false,
             SystemEvent::Shutdown { .. } => self.halting = true,
             SystemEvent::ShutdownCancelled => self.halting = false,
+            SystemEvent::SessionChange => {}
         }
     }
 
@@ -206,8 +208,11 @@ impl AckWait {
 
 /// The reply of a `Suspend` or `Shutdown` that waits for the ack of its `offline`.
 /// The run loop keeps polling the event loop during the wait.
-#[derive(Default)]
-struct SuspendWait(Option<PendingSuspend>);
+struct SuspendWait {
+    pending: Option<PendingSuspend>,
+    /// The longest wait for the ack.
+    ack_wait: Duration,
+}
 
 struct PendingSuspend {
     ack: AckWait,
@@ -216,6 +221,13 @@ struct PendingSuspend {
 }
 
 impl SuspendWait {
+    fn new(ack_wait: Duration) -> Self {
+        SuspendWait {
+            pending: None,
+            ack_wait,
+        }
+    }
+
     /// Starts the wait of `done`. `backlog` is `None` when `offline` was not
     /// queued (not connected): `done` completes at once.
     fn start(
@@ -231,9 +243,9 @@ impl SuspendWait {
                 let _ = done.send(());
             }
             Some(backlog) => {
-                self.0 = Some(PendingSuspend {
+                self.pending = Some(PendingSuspend {
                     ack: AckWait::new(backlog),
-                    deadline: now + OFFLINE_ACK_TIMEOUT,
+                    deadline: now + self.ack_wait,
                     done,
                 })
             }
@@ -241,7 +253,7 @@ impl SuspendWait {
     }
 
     fn on_event(&mut self, event: &Event) {
-        if let Some(pending) = &mut self.0
+        if let Some(pending) = &mut self.pending
             && pending.ack.on_event(event)
         {
             info!("offline acknowledged before sleep or shutdown");
@@ -250,15 +262,15 @@ impl SuspendWait {
     }
 
     fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.0.as_ref().map(|p| p.deadline)
+        self.pending.as_ref().map(|p| p.deadline)
     }
 
     /// Completes the reply when the deadline has passed.
     fn expire(&mut self, now: tokio::time::Instant) {
         if self.deadline().is_some_and(|d| now >= d) {
             warn!(
-                "no ack for offline before sleep or shutdown within {} s",
-                OFFLINE_ACK_TIMEOUT.as_secs()
+                "no ack for offline before sleep or shutdown within {:?}",
+                self.ack_wait
             );
             self.finish();
         }
@@ -266,7 +278,7 @@ impl SuspendWait {
 
     /// Completes the reply at once, if a wait is in progress.
     fn finish(&mut self) {
-        if let Some(pending) = self.0.take() {
+        if let Some(pending) = self.pending.take() {
             let _ = pending.done.send(());
         }
     }
@@ -322,13 +334,15 @@ impl Session {
 
 /// Runs the agent until `stop` completes, then publishes `offline` and disconnects.
 /// `model` is the device model of the discovery configs. Every 2 s, `poll`
-/// gives a snapshot to `core`; `events` gives the sleep and wake events.
+/// gives a snapshot to `core`; `events` gives the sleep, wake and session
+/// events. `ack_wait` is the longest wait for the ack of `offline`.
 pub async fn run<P, F>(
     cfg: &Config,
     model: &str,
     mut core: Core,
     mut poll: P,
     mut events: mpsc::Receiver<SystemEvent>,
+    ack_wait: Duration,
     stop: F,
 ) -> Result<()>
 where
@@ -353,7 +367,7 @@ where
     let mut connected = false;
     // After a connection error: the time of the next connect attempt.
     let mut retry_at: Option<tokio::time::Instant> = None;
-    let mut suspend = SuspendWait::default();
+    let mut suspend = SuspendWait::new(ack_wait);
     let mut pause = Pause::default();
 
     loop {
@@ -368,6 +382,15 @@ where
                 }
             }
             Some(event) = events.recv() => {
+                if let SystemEvent::SessionChange = event {
+                    // The snapshot of the tick, at once; the core derives the
+                    // session events from it.
+                    if connected && pause.tick_allowed() {
+                        let states = core.update(poll(), Instant::now());
+                        session.publish_states(cfg, states);
+                    }
+                    continue;
+                }
                 pause.on_event(&event);
                 // `true` when the last publish (`offline` of a Suspend) is queued.
                 let mut last_queued = false;
@@ -414,16 +437,16 @@ where
     }
 
     suspend.finish();
-    shutdown(&mut session, cfg).await;
+    shutdown(&mut session, cfg, ack_wait).await;
     Ok(())
 }
 
-async fn shutdown(session: &mut Session, cfg: &Config) {
+async fn shutdown(session: &mut Session, cfg: &Config, ack_wait: Duration) {
     info!("stopping: publish offline and disconnect");
     let mut ack = AckWait::new(session.backlog());
     session.publish(availability_message(cfg, OFFLINE));
 
-    let acked = timeout(OFFLINE_ACK_TIMEOUT, async {
+    let acked = timeout(ack_wait, async {
         loop {
             match session.eventloop.poll().await {
                 Ok(event) if ack.on_event(&event) => return,
@@ -438,10 +461,7 @@ async fn shutdown(session: &mut Session, cfg: &Config) {
     .await;
     match acked {
         Ok(()) => info!("offline acknowledged"),
-        Err(_) => warn!(
-            "no ack for offline within {} s",
-            OFFLINE_ACK_TIMEOUT.as_secs()
-        ),
+        Err(_) => warn!("no ack for offline within {ack_wait:?}"),
     }
 
     if let Err(e) = session.client.try_disconnect() {
@@ -710,7 +730,7 @@ enabled = false
     async fn shutdown_done_completes_on_the_ack_after_2_s_or_at_once() {
         // The Shutdown reply goes through the same wait as the Suspend reply.
         let mut core = Core::new(&WITH_EVENTS, None);
-        let mut wait = SuspendWait::default();
+        let mut wait = SuspendWait::new(Duration::from_secs(2));
 
         let (done, mut rx) = oneshot::channel();
         let (_, reply) = messages_of(&mut core, SystemEvent::Shutdown { done });
@@ -771,7 +791,7 @@ enabled = false
 
     #[tokio::test(start_paused = true)]
     async fn suspend_done_completes_when_offline_is_acknowledged() {
-        let mut suspend = SuspendWait::default();
+        let mut suspend = SuspendWait::new(Duration::from_secs(2));
         let (done, mut rx) = tokio::sync::oneshot::channel();
         suspend.start(done, Some(0), tokio::time::Instant::now());
         suspend.on_event(&outgoing(3));
@@ -782,25 +802,38 @@ enabled = false
     }
 
     #[tokio::test(start_paused = true)]
-    async fn suspend_done_completes_after_2_s_without_an_ack() {
-        let mut suspend = SuspendWait::default();
-        let (done, mut rx) = tokio::sync::oneshot::channel();
-        let start = tokio::time::Instant::now();
-        suspend.start(done, Some(0), start);
-        assert_eq!(suspend.deadline(), Some(start + Duration::from_secs(2)));
-        suspend.on_event(&outgoing(3));
-        tokio::time::advance(Duration::from_millis(1999)).await;
-        suspend.expire(tokio::time::Instant::now());
-        assert!(rx.try_recv().is_err());
-        tokio::time::advance(Duration::from_millis(1)).await;
-        suspend.expire(tokio::time::Instant::now());
-        assert_eq!(rx.try_recv(), Ok(()));
-        assert_eq!(suspend.deadline(), None);
+    async fn suspend_done_completes_after_the_ack_wait_without_an_ack() {
+        // 1.5 s on Windows, 2 s on Linux and macOS.
+        for wait in [Duration::from_millis(1500), Duration::from_secs(2)] {
+            let mut suspend = SuspendWait::new(wait);
+            let (done, mut rx) = tokio::sync::oneshot::channel();
+            let start = tokio::time::Instant::now();
+            suspend.start(done, Some(0), start);
+            assert_eq!(suspend.deadline(), Some(start + wait), "{wait:?}");
+            suspend.on_event(&outgoing(3));
+            tokio::time::advance(wait - Duration::from_millis(1)).await;
+            suspend.expire(tokio::time::Instant::now());
+            assert!(rx.try_recv().is_err(), "{wait:?}");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            suspend.expire(tokio::time::Instant::now());
+            assert_eq!(rx.try_recv(), Ok(()), "{wait:?}");
+            assert_eq!(suspend.deadline(), None);
+        }
+    }
+
+    #[test]
+    fn the_ack_wait_is_1_5_s_on_windows_and_2_s_on_linux_and_macos() {
+        let expected = if cfg!(windows) {
+            Duration::from_millis(1500)
+        } else {
+            Duration::from_secs(2)
+        };
+        assert_eq!(crate::sources::ACK_WAIT, expected);
     }
 
     #[tokio::test(start_paused = true)]
     async fn suspend_done_completes_at_once_when_not_connected() {
-        let mut suspend = SuspendWait::default();
+        let mut suspend = SuspendWait::new(Duration::from_secs(2));
         let (done, mut rx) = tokio::sync::oneshot::channel();
         suspend.start(done, None, tokio::time::Instant::now());
         assert_eq!(rx.try_recv(), Ok(()));
@@ -809,7 +842,7 @@ enabled = false
 
     #[tokio::test(start_paused = true)]
     async fn a_lost_connection_completes_the_suspend_at_once() {
-        let mut suspend = SuspendWait::default();
+        let mut suspend = SuspendWait::new(Duration::from_secs(2));
         let (done, mut rx) = tokio::sync::oneshot::channel();
         suspend.start(done, Some(1), tokio::time::Instant::now());
         suspend.finish();
