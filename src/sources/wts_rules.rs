@@ -101,8 +101,13 @@ pub async fn shutdown(events: &mpsc::Sender<SystemEvent>) {
 }
 
 /// The warning of `pc-agent install` for the `HiberbootEnabled` value.
-pub fn fast_startup_warning(hiberboot: Option<u32>) -> Option<&'static str> {
-    (hiberboot == Some(1)).then_some(
+pub fn fast_startup_warning(
+    hiberboot: Option<u32>,
+    hibernate: Option<u32>,
+) -> Option<&'static str> {
+    // Fast Startup needs hibernation: `powercfg /h off` keeps
+    // HiberbootEnabled = 1 but sets HibernateEnabled = 0.
+    (hiberboot == Some(1) && hibernate != Some(0)).then_some(
         "warning: Fast Startup is on (HiberbootEnabled = 1). A shutdown then \
          hibernates the kernel: lastboot is wrong and no SystemShutdown event \
          is sent. Turn it off with: powercfg /h off",
@@ -401,11 +406,16 @@ mod tests {
 
     #[test]
     fn hiberboot_1_gives_the_fast_startup_warning_and_0_or_none_no_warning() {
-        let warning = fast_startup_warning(Some(1)).expect("a warning for 1");
+        let warning = fast_startup_warning(Some(1), Some(1)).expect("a warning for 1");
         assert!(warning.contains("Fast Startup"), "{warning}");
         assert!(warning.contains("powercfg /h off"), "{warning}");
-        assert_eq!(fast_startup_warning(Some(0)), None);
-        assert_eq!(fast_startup_warning(None), None);
+        // A missing HibernateEnabled value: hibernation is on by default.
+        assert!(fast_startup_warning(Some(1), None).is_some());
+        assert_eq!(fast_startup_warning(Some(0), Some(1)), None);
+        assert_eq!(fast_startup_warning(None, Some(1)), None);
+        // `powercfg /h off` keeps HiberbootEnabled = 1 but turns hibernation
+        // off, and Fast Startup cannot run without it.
+        assert_eq!(fast_startup_warning(Some(1), Some(0)), None);
     }
 
     #[test]

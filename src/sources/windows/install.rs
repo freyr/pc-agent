@@ -16,7 +16,7 @@ use ::windows::Win32::Security::{
     PSECURITY_DESCRIPTOR,
 };
 use ::windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
-use ::windows::core::{BOOL, HSTRING, w};
+use ::windows::core::{BOOL, HSTRING, PCWSTR, w};
 use anyhow::{Context, Result};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
@@ -125,24 +125,32 @@ fn try_install(config: Option<&Path>) -> Result<()> {
         .context("cannot set the preshutdown timeout")?;
     println!("created the service {SERVICE_NAME} (LocalSystem, automatic start)");
     // Only a warning: the setting stays as it is.
-    if let Some(warning) = fast_startup_warning(hiberboot_enabled()) {
+    let hiberboot = reg_dword(
+        w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Power"),
+        w!("HiberbootEnabled"),
+    );
+    let hibernate = reg_dword(
+        w!(r"SYSTEM\CurrentControlSet\Control\Power"),
+        w!("HibernateEnabled"),
+    );
+    if let Some(warning) = fast_startup_warning(hiberboot, hibernate) {
         println!("{warning}");
     }
     Ok(())
 }
 
-/// `HiberbootEnabled` of the power settings (1 when Fast Startup is on), or
-/// `None` when the value is missing or cannot be read.
-fn hiberboot_enabled() -> Option<u32> {
+/// A DWORD value under HKEY_LOCAL_MACHINE, or `None` when the value is
+/// missing or cannot be read.
+fn reg_dword(key: PCWSTR, name: PCWSTR) -> Option<u32> {
     let mut value: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
-    // SAFETY: static wide strings; `value` and `size` are valid for the
-    // DWORD that RRF_RT_REG_DWORD allows.
+    // SAFETY: `key` and `name` are static wide strings; `value` and `size`
+    // are valid for the DWORD that RRF_RT_REG_DWORD allows.
     let result = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
-            w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Power"),
-            w!("HiberbootEnabled"),
+            key,
+            name,
             RRF_RT_REG_DWORD,
             None,
             Some((&mut value as *mut u32).cast()),

@@ -208,13 +208,19 @@ fn run_service() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(crate::config::DEFAULT_PATH));
     let result = crate::run(config, || {
         Ok(async move {
-            stop_control(rx, &events_tx).await;
+            let preshutdown = stop_control(rx).await;
+            // windows-service frees the handler closure after Stop and
+            // Preshutdown, so accept no control from here on, before the
+            // shutdown wait below.
             if let Err(e) = handle.set_service_status(status(
                 ServiceState::StopPending,
                 ServiceControlAccept::empty(),
                 0,
             )) {
                 warn!(error = %e, "cannot report StopPending");
+            }
+            if preshutdown {
+                wts_rules::shutdown(&events_tx).await;
             }
         })
     });
@@ -227,19 +233,17 @@ fn run_service() -> Result<()> {
     result
 }
 
-/// Completes at the first `Stop`, or at the first `Preshutdown` after the
-/// core has published `SystemShutdown` and `offline`.
-async fn stop_control(
-    mut controls: UnboundedReceiver<ServiceControl>,
-    events: &mpsc::Sender<SystemEvent>,
-) {
+/// Completes at the first `Stop` or `Preshutdown`; true for `Preshutdown`.
+async fn stop_control(mut controls: UnboundedReceiver<ServiceControl>) -> bool {
     // The handler sends only Stop and Preshutdown here.
-    if let Some(control) = controls.recv().await {
-        if let ServiceControl::Preshutdown = control {
+    match controls.recv().await {
+        Some(ServiceControl::Preshutdown) => {
             info!("preshutdown received");
-            wts_rules::shutdown(events).await;
-        } else {
+            true
+        }
+        _ => {
             info!("service stop received");
+            false
         }
     }
 }

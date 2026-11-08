@@ -154,15 +154,28 @@ jobs:
           [gpu]
           enabled = true
           "@ | Set-Content -Path $cfg -Encoding utf8
-          $out = .\target\release\pc-agent.exe install --config $cfg
-          if ($LASTEXITCODE -ne 0) { throw "pc-agent install failed" }
-          $out
-          # The Fast Startup warning comes exactly when HiberbootEnabled is 1.
-          $hiberboot = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' `
-            -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
-          "HiberbootEnabled: '$hiberboot'"
-          $warned = [bool]($out | Select-String -SimpleMatch 'Fast Startup is on')
-          if ($warned -ne ($hiberboot -eq 1)) { throw "Fast Startup warning: $warned, HiberbootEnabled: '$hiberboot'" }
+          # The runner has Fast Startup off, so turn it on for the install to
+          # prove that the registry read and the warning work, then restore.
+          $values = @(
+            @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; Name = 'HiberbootEnabled' },
+            @{ Key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'; Name = 'HibernateEnabled' }
+          )
+          foreach ($v in $values) {
+            $v.Old = (Get-ItemProperty $v.Key -Name $v.Name -ErrorAction SilentlyContinue).($v.Name)
+            "$($v.Name) before: '$($v.Old)'"
+            Set-ItemProperty -Path $v.Key -Name $v.Name -Value 1 -Type DWord
+          }
+          try {
+            $out = .\target\release\pc-agent.exe install --config $cfg
+            if ($LASTEXITCODE -ne 0) { throw "pc-agent install failed" }
+            $out
+          } finally {
+            foreach ($v in $values) {
+              if ($null -eq $v.Old) { Remove-ItemProperty -Path $v.Key -Name $v.Name -ErrorAction SilentlyContinue }
+              else { Set-ItemProperty -Path $v.Key -Name $v.Name -Value $v.Old -Type DWord }
+            }
+          }
+          if (-not ($out | Select-String -SimpleMatch 'Fast Startup is on')) { throw "no Fast Startup warning with Fast Startup on" }
           sc.exe qc pc-agent
           sc.exe qfailure pc-agent
 
