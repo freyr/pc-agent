@@ -1,8 +1,9 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -711,3 +712,14 @@ jobs:
           Get-Content C:\ProgramData\pc-agent\pc-agent.log -ErrorAction SilentlyContinue
           Get-Content (Join-Path $env:RUNNER_TEMP "mosquitto.log") -ErrorAction SilentlyContinue
           $global:LASTEXITCODE = 0
+
+  # The one required CI check of the freyr standard. It needs every other job of
+  # this workflow; add each new job to `needs`.
+  ci-gate:
+    if: always()
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: freyr/.github/actions/ci-gate@FREYR_SHA # v1.0.0
+        with:
+          results: ${{ join(needs.*.result, ' ') }}

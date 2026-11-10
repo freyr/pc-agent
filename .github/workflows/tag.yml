@@ -1,0 +1,33 @@
+# The release job of the freyr standard (freyr/.github). On each push to main it
+# compares the version in Cargo.toml with the last tag vX.Y.Z. When the version is
+# higher, the release App pushes the annotated tag (message: title + release
+# notes). The tag push starts release.yml, which builds and signs the assets and
+# creates the GitHub release. This job pushes no commit.
+name: Tag
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Not the group of release.yml (release-<ref>).
+concurrency:
+  group: freyr-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      releases: ${{ steps.release.outputs.releases }}
+    steps:
+      - id: release
+        uses: freyr/.github/actions/release@FREYR_SHA # v1.0.0
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # release.yml creates the GitHub release with all assets and the
+          # signed manifest, so this job pushes only the annotated tag.
+          github-release: "false"

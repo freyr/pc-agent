@@ -1,0 +1,24 @@
+{
+  "packages": [
+    {
+      "name": "pc-agent",
+      "path": ".",
+      "tag": "v{version}",
+      "version_files": [
+        { "file": "Cargo.toml", "format": "cargo" }
+      ],
+      "ignore": [
+        "*.md",
+        ".gitignore",
+        ".gitattributes",
+        "src/update/testdata/**",
+        "scripts/check-edge.sh",
+        "scripts/check-manifest.sh",
+        "scripts/e2e-update.sh",
+        "scripts/probe.sh",
+        "scripts/probe-macos.sh"
+      ],
+      "min_bump": "none"
+    }
+  ]
+}

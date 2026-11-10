@@ -171,12 +171,31 @@ cargo test
 The Linux code builds and tests on any OS in a container:
 `docker run --rm -v "$PWD":/src -w /src rust:1 cargo test`.
 
-`main` is protected: changes go in through pull requests. CI runs on each push and pull request for
-Linux and macOS.
+`main` is protected: changes go in through pull requests, merged with squash. CI runs on each pull
+request and on each push to `main`, for Linux, macOS and Windows. The required checks are
+`pr-title`, `version` and `ci-gate`.
+
+The repository follows the release standard of [`freyr/.github`](https://github.com/freyr/.github).
+The PR title is the squash commit title and the only release input. It follows
+[Conventional Commits](https://www.conventionalcommits.org/):
+
+| PR title | Version change |
+|---|---|
+| `feat: …` | minor |
+| `fix: …`, `perf: …`, `revert: …` | patch |
+| `feat!: …`, or `BREAKING CHANGE:` in the PR body | major (minor before 1.0.0) |
+| `docs:`, `test:`, `ci:`, `build:`, `refactor:`, `chore:`, `style:` | none |
+
+A change of only Markdown files, test data or CI-only scripts makes no release (see
+`.github/release.json`). Do not edit the version in `Cargo.toml` by hand, and do not push tags.
 
 Releases come only from `main`:
 
 - Each push to `main` replaces the pre-release
   [`edge`](https://github.com/freyr/pc-mqtt-agent/releases/tag/edge), the bleeding-edge build.
-- A semver tag `vX.Y.Z` on a commit of `main` makes a normal release. The tag must match the
-  `version` in `Cargo.toml`.
+- On each PR, the `version` job sets the next version in `Cargo.toml` and `Cargo.lock` from the PR
+  title, with a commit of the release App on the PR branch.
+- After the merge, `tag.yml` compares the version in `Cargo.toml` with the last tag. When the
+  version is higher, the release App pushes the annotated tag `vX.Y.Z`, whose message holds the
+  release notes. The tag starts `release.yml`, which builds and signs the assets and creates the
+  GitHub release with those notes.
