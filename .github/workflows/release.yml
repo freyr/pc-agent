@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # The one Rust version of release.yml and of CI. Change both together. The
+  # release builds use no cache, so a poisoned cache cannot reach a release.
+  RUST_TOOLCHAIN: "1.99.1"
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_type == 'branch' }}
@@ -22,8 +27,9 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Check that the commit is on main
         run: |
@@ -44,12 +50,15 @@ jobs:
     needs: check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo build --release
       - run: bash scripts/package.sh dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pc-agent-x86_64-linux
           path: |
@@ -62,12 +71,15 @@ jobs:
     needs: check
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo build --release
       - run: bash scripts/package.sh dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pc-agent-aarch64-macos
           path: |
@@ -76,7 +88,7 @@ jobs:
             dist/pc-agent-aarch64-macos.tar.gz.sha256
           if-no-files-found: error
       - run: bash scripts/build-pkg.sh dist
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pc-agent-macos-pkg
           path: |
@@ -92,9 +104,12 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo build --release
       - name: Copy the exe and write its checksum
         run: |
@@ -104,7 +119,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 "dist\$name").Hash.ToLower()
           # The format of sha256sum, so `sha256sum -c` checks it.
           [IO.File]::WriteAllText("$PWD\dist\$name.sha256", "$hash  $name`n")
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pc-agent-x86_64-windows
           path: |
@@ -123,8 +138,10 @@ jobs:
     steps:
       # scripts/manifest.sh reads the version, the commit and the commit time
       # (the build time that build.rs embeds) from the checkout.
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true

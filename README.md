@@ -166,7 +166,12 @@ give its sensor IDs in a `[unique_ids]` section (`sessionstate`, `lastactive`, `
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo deny --all-features check   # licenses, advisories, duplicate crates (deny.toml)
+cargo llvm-cov --summary-only      # coverage (advisory in CI)
 ```
+
+CI uses Rust 1.99.1 (`RUST_TOOLCHAIN` in `ci.yml` and `release.yml`) and also runs gitleaks and
+zizmor.
 
 The Linux code builds and tests on any OS in a container:
 `docker run --rm -v "$PWD":/src -w /src rust:1 cargo test`.

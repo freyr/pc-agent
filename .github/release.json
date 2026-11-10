@@ -11,6 +11,7 @@
         "*.md",
         ".gitignore",
         ".gitattributes",
+        "deny.toml",
         "src/update/testdata/**",
         "scripts/check-edge.sh",
         "scripts/check-manifest.sh",
