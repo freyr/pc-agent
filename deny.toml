@@ -1,0 +1,50 @@
+# cargo-deny configuration: `cargo deny check` (CI job `deny`).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# The three platforms of the agent, so the license and advisory checks see the
+# dependencies of each platform.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+# All advisories (vulnerability, unmaintained, unsound, notice) fail the check,
+# except the ones in `ignore` (each with a reason).
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# The licenses of the dependencies today. Add a license only after a review.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# pc-agent itself is not published to crates.io (`publish = false`).
+ignore = true
+
+[bans]
+# A second version of a crate is a warning: the duplicates (getrandom, syn,
+# thiserror, windows-sys) come from dependencies.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = false
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
