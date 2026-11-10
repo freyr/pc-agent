@@ -16,7 +16,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 exe="$1"
-url="https://github.com/freyr/pc-agent/releases/download/edge/manifest.json"
+url="https://github.com/freyr/pc-mqtt-agent/releases/download/edge/manifest.json"
 
 for attempt in 1 2 3 4 5; do
   echo "== attempt $attempt"

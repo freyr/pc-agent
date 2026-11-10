@@ -1,4 +1,4 @@
-# pc-agent
+# pc-mqtt-agent
 
 A small system agent that reports the power, session and activity state of a PC to Home Assistant
 over MQTT. It runs as a root service on Linux (systemd) and macOS (LaunchDaemon).
@@ -26,15 +26,15 @@ a clean stop, at sleep and at shutdown (the broker's last will covers a crash).
 
 ## Install
 
-Download the files from the [latest release](https://github.com/freyr/pc-agent/releases/latest).
+Download the files from the [latest release](https://github.com/freyr/pc-mqtt-agent/releases/latest).
 The pre-release `edge` holds the newest build of `main`, for testing.
 
 ### Linux (x86_64)
 
 ```sh
 mkdir pc-agent && cd pc-agent
-curl -LO https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-linux.tar.gz
-curl -LO https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-linux.tar.gz.sha256
+curl -LO https://github.com/freyr/pc-mqtt-agent/releases/latest/download/pc-agent-x86_64-linux.tar.gz
+curl -LO https://github.com/freyr/pc-mqtt-agent/releases/latest/download/pc-agent-x86_64-linux.tar.gz.sha256
 sha256sum -c pc-agent-x86_64-linux.tar.gz.sha256
 tar -xzf pc-agent-x86_64-linux.tar.gz
 sudo scripts/install.sh                 # installs the binary and the systemd unit
@@ -61,8 +61,8 @@ registers the path of the running exe, and the self-update replaces the exe in t
 ```powershell
 New-Item -ItemType Directory -Force "C:\Program Files\pc-agent" | Out-Null
 cd "C:\Program Files\pc-agent"
-Invoke-WebRequest https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-windows.exe -OutFile pc-agent.exe
-Invoke-WebRequest https://github.com/freyr/pc-agent/releases/latest/download/pc-agent-x86_64-windows.exe.sha256 -OutFile pc-agent.exe.sha256
+Invoke-WebRequest https://github.com/freyr/pc-mqtt-agent/releases/latest/download/pc-agent-x86_64-windows.exe -OutFile pc-agent.exe
+Invoke-WebRequest https://github.com/freyr/pc-mqtt-agent/releases/latest/download/pc-agent-x86_64-windows.exe.sha256 -OutFile pc-agent.exe.sha256
 (Get-FileHash pc-agent.exe).Hash -eq (Get-Content pc-agent.exe.sha256).Split(" ")[0].ToUpper()   # must print True
 .\pc-agent.exe install                                  # creates the service and C:\ProgramData\pc-agent
 notepad C:\ProgramData\pc-agent\config.toml             # set the broker and the device (see Configuration)
@@ -177,6 +177,6 @@ Linux and macOS.
 Releases come only from `main`:
 
 - Each push to `main` replaces the pre-release
-  [`edge`](https://github.com/freyr/pc-agent/releases/tag/edge), the bleeding-edge build.
+  [`edge`](https://github.com/freyr/pc-mqtt-agent/releases/tag/edge), the bleeding-edge build.
 - A semver tag `vX.Y.Z` on a commit of `main` makes a normal release. The tag must match the
   `version` in `Cargo.toml`.
