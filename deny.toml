@@ -32,10 +32,6 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-[licenses.private]
-# pc-agent itself is not published to crates.io (`publish = false`).
-ignore = true
-
 [bans]
 # A second version of a crate is a warning: the duplicates (getrandom, syn,
 # thiserror, windows-sys) come from dependencies.
