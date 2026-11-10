@@ -1,7 +1,9 @@
 name: Release
 
 # main is the bleeding edge: each push to main replaces the pre-release "edge".
-# A semver tag vX.Y.Z on a commit of main makes a normal release.
+# A semver tag vX.Y.Z on a commit of main makes a normal release. The release App
+# of tag.yml pushes the tag (no GitHub release); its annotated message holds the
+# title and the release notes.
 on:
   push:
     branches:
@@ -158,10 +160,22 @@ jobs:
       - name: Create the semver release
         if: github.ref_type == 'tag'
         run: |
+          # The notes: the message of the annotated tag that tag.yml pushed,
+          # without its first line (the title) and the blank line after it.
+          # A lightweight tag (no message) falls back to the generated notes.
+          notes_args=(--generate-notes)
+          ref_json="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME")"
+          if [[ "$(jq -r .object.type <<<"$ref_json")" == "tag" ]]; then
+            gh api "repos/$GH_REPO/git/tags/$(jq -r .object.sha <<<"$ref_json")" --jq .message \
+              | tail -n +3 > "$RUNNER_TEMP/notes.md"
+            if [[ -s "$RUNNER_TEMP/notes.md" ]]; then
+              notes_args=(--notes-file "$RUNNER_TEMP/notes.md")
+            fi
+          fi
           # A draft until all assets and the manifest are there: a failed
           # upload leaves no public release without a manifest.
           gh release create "$GITHUB_REF_NAME" dist/* signed/manifest.json signed/manifest.json.minisig \
-            --draft --generate-notes
+            --draft "${notes_args[@]}"
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
       - name: Replace the edge pre-release
         if: github.ref_type == 'branch'
