@@ -177,7 +177,7 @@ jobs:
 
       - name: Restore the Mosquitto installer from the cache
         id: mosquitto-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/mosquitto-2.0.22-install-windows-x64.exe
           key: mosquitto-2.0.22-install-windows-x64
