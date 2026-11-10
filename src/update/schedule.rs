@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(s["release_summary"], "");
         assert_eq!(
             s["release_url"],
-            "https://github.com/freyr/pc-agent/releases/tag/v0.3.1"
+            "https://github.com/freyr/pc-mqtt-agent/releases/tag/v0.3.1"
         );
         assert_eq!(s["in_progress"], false);
     }
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(s["in_progress"], false);
         assert_eq!(
             s["release_url"],
-            "https://github.com/freyr/pc-agent/releases/tag/v0.3.0"
+            "https://github.com/freyr/pc-mqtt-agent/releases/tag/v0.3.0"
         );
         // Edge: the version and the short commit.
         let edge = updater(&paths, &fake, true, Channel::Edge);
@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(s["latest_version"], "0.3.0 (1111111)");
         assert_eq!(
             s["release_url"],
-            "https://github.com/freyr/pc-agent/releases/tag/edge"
+            "https://github.com/freyr/pc-mqtt-agent/releases/tag/edge"
         );
     }
 

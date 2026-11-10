@@ -18,7 +18,7 @@ use crate::config::Update;
 
 /// The releases of the project. `stable` reads
 /// `<base>/latest/download/<file>`, `edge` reads `<base>/download/edge/<file>`.
-pub const BASE_URL: &str = "https://github.com/freyr/pc-agent/releases";
+pub const BASE_URL: &str = "https://github.com/freyr/pc-mqtt-agent/releases";
 
 /// The limit of one download (connect, redirects, body).
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -495,11 +495,11 @@ pub(super) mod tests {
     fn urls_of_the_channels() {
         assert_eq!(
             url(BASE_URL, Channel::Stable, "manifest.json"),
-            "https://github.com/freyr/pc-agent/releases/latest/download/manifest.json"
+            "https://github.com/freyr/pc-mqtt-agent/releases/latest/download/manifest.json"
         );
         assert_eq!(
             url(BASE_URL, Channel::Edge, "manifest.json.minisig"),
-            "https://github.com/freyr/pc-agent/releases/download/edge/manifest.json.minisig"
+            "https://github.com/freyr/pc-mqtt-agent/releases/download/edge/manifest.json.minisig"
         );
     }
 
